@@ -163,6 +163,22 @@ TOOLSETS = {
         "includes": []
     },
     
+    "toolbox": {
+        "description": (
+            "Toolbox gateway \u2014 collapse niche tools into a single discovery tool. "
+            "The LLM uses toolbox list/explain/run to find and invoke infrequently-needed "
+            "tools instead of bloating the system prompt with all their schemas."
+        ),
+        "tools": ["toolbox"],
+        "includes": []
+    },
+
+    "moa": {
+        "description": "Advanced reasoning and problem-solving tools",
+        "tools": ["mixture_of_agents"],
+        "includes": []
+    },
+
     "skills": {
         "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",
         "tools": ["skills_list", "skill_view", "skill_manage"],

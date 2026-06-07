@@ -144,7 +144,20 @@ def get_skin_tool_prefix() -> str:
     return "┊"
 
 
-def get_tool_emoji(tool_name: str, default: str = "⚡") -> str:
+def resolve_display_tool_name(tool_name: str, args: dict | None = None) -> str:
+    """Return the tool name used for display (emoji, preview, completion).
+
+    For ``toolbox run`` calls, returns the inner tool name so the display
+    renders as the actual tool being called rather than as "toolbox".
+    """
+    if tool_name == "toolbox" and args and args.get("command") == "run":
+        inner = args.get("toolName", "")
+        if inner:
+            return inner
+    return tool_name
+
+
+def get_tool_emoji(tool_name: str, default: str = "\u26a1") -> str:
     """Get the display emoji for a tool.
 
     Resolution order:
@@ -528,10 +541,32 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         file_path = args.get("file_path")
         if file_path:
             file_path = _oneline(str(file_path))
-            preview = f"{name} → {file_path}" if name else file_path
+            preview = f"{name} \u2192 {file_path}" if name else file_path
         else:
             preview = name
         return _truncate_preview(preview, max_len) if preview else None
+
+    if tool_name == "toolbox":
+        command = args.get("command", "")
+        subject = args.get("subject", "")
+        tool_target = args.get("toolName", "")
+        inner_args = args.get("args", {})
+        # For "run", delegate display to the inner tool, then append subject
+        if command == "run" and tool_target:
+            inner = build_tool_preview(tool_target, inner_args or {}, max_len=max_len)
+            subject = args.get("subject", "")
+            if subject:
+                inner = f"{inner}  {subject}" if inner else subject
+            return inner
+        if command == "explain":
+            names = args.get("toolNames") or ([tool_target] if tool_target else [])
+            if names:
+                return f"explain {', '.join(names) if isinstance(names, list) else str(names)}"
+        if command == "list":
+            return "list tools"
+        if command == "hints":
+            return "read hints"
+        return command or None
 
     key = primary_args.get(tool_name)
     if not key:
@@ -1304,6 +1339,32 @@ def _get_cute_tool_message(
             return line
         return f"{line}{failure_suffix}"
 
+    if tool_name == "toolbox":
+        command = args.get("command", "")
+        tool_target = args.get("toolName", "")
+        inner_args = args.get("args", {})
+        # For "run", delegate display to the inner tool, then append the
+        # toolbox subject (the LLM's brief intent) as a trailing annotation.
+        if command == "run" and tool_target:
+            inner_msg = get_cute_tool_message(tool_target, inner_args or {}, duration, result=result)
+            subject = args.get("subject", "")
+            if subject:
+                # Insert subject before the trailing "  {dur}" suffix
+                suffix = f"  {dur}"
+                if inner_msg.endswith(suffix):
+                    inner_msg = inner_msg[: -len(suffix)] + f"  {subject}{suffix}"
+            return inner_msg
+        if command == "explain":
+            names = args.get("toolNames", []) or ([tool_target] if tool_target else [])
+            label = ", ".join(names) if isinstance(names, list) else str(names)
+            return _wrap(f"┊ 🧰 explain   {_trunc(label, 35)}  {dur}")
+        if command == "list":
+            return _wrap(f"┊ 🧰 list      tools  {dur}")
+        if command == "hints":
+            method = args.get("method", "READ")
+            verb = "browse" if method == "READ" else method.lower()
+            return _wrap(f"┊ 🧰 hints     {verb}  {dur}")
+        return _wrap(f"┊ 🧰 {command[:9]:9} {dur}")
     if tool_name == "web_search":
         return _wrap(f"┊ 🔍 search    {_trunc(args.get('query', ''), 42)}  {dur}")
     if tool_name == "web_extract":

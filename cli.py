@@ -10937,7 +10937,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         from agent.display import get_tool_emoji
         emoji = get_tool_emoji(tool_name, default="⚡")
-        _cprint(f"  ┊ {emoji} preparing {tool_name}…")
+        if tool_name == "toolbox":
+            _cprint(f"  ┊ {emoji} …")
+        else:
+            _cprint(f"  ┊ {emoji} preparing {tool_name}…")
 
     # ====================================================================
     # Tool progress callback (audio cues for voice mode)

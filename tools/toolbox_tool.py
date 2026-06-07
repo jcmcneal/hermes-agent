@@ -1,9 +1,8 @@
 """Toolbox gateway — single root tool for all tool interactions.
 
 The schema, command dispatch, and helper logic all live in ``toolbox_gateway``.
-This file just wires the registry into Hermes: builds a ``Toolbox`` instance
-from the registry's tool list, registers it as a single discoverable tool,
-and proxies calls to ``toolbox.handle()``.
+This file just wires the registry into Hermes and registers the gateway
+as a single discoverable tool.
 
 All tool calls go through toolbox. The LLM discovers tools at runtime:
 ``list`` → ``explain`` → ``run`` → ``hints``.
@@ -14,6 +13,9 @@ Requires: ``toolbox-gateway`` package (pip install toolbox-gateway)
 import json
 import logging
 
+from toolbox_gateway import GATEWAY_TOOL_NAME, Toolbox, is_available
+from toolbox_gateway.backends.sqlite_store import SQLiteHintStore
+
 from tools.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -23,30 +25,26 @@ def _get_toolbox():
     """Lazy-init the Toolbox singleton with all registry tools and SQLite hints."""
     global _toolbox_instance
     if _toolbox_instance is None:
-        from toolbox_gateway import Toolbox, Tool
-        from toolbox_gateway.backends.sqlite_store import SQLiteHintStore
-
         from hermes_constants import get_hermes_home
 
         hint_db = get_hermes_home() / "toolbox_hints.db"
         hint_store = SQLiteHintStore(path=str(hint_db))
 
-        tools = [
-            Tool(
-                name=entry.name,
-                description=entry.description or entry.schema.get("description", ""),
-                schema=entry.schema.get("parameters", {}),
-                execute=lambda args, _name=entry.name, **kw: _dispatch_tool(_name, args),
-            )
+        definitions = [
+            {
+                "name": entry.name,
+                "description": entry.description or entry.schema.get("description", ""),
+                "schema": entry.schema.get("parameters", {}),
+            }
             for entry in registry._snapshot_entries()
-            if entry.name != "toolbox"
+            if entry.name != GATEWAY_TOOL_NAME
             and (not entry.check_fn or entry.check_fn())
         ]
 
-        _toolbox_instance = Toolbox(
-            tools=tools,
+        _toolbox_instance = Toolbox.from_definitions(
+            definitions=definitions,
+            dispatcher=_dispatch_tool,
             hint_store=hint_store,
-            schema_format="markdown",  # compact markdown is the whole point
         )
     return _toolbox_instance
 
@@ -92,30 +90,21 @@ def toolbox_handler(args: dict, **kwargs) -> str:
         return json.dumps({"success": False, "error": str(e)})
 
 
-def check_toolbox_requirements() -> bool:
-    """Toolbox is available if the toolbox-gateway package is installed."""
-    try:
-        import toolbox_gateway  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
 def _get_schema() -> dict:
     """Get the canonical toolbox schema from toolbox-gateway."""
-    if not check_toolbox_requirements():
+    if not is_available():
         return {}
     from toolbox_gateway import Toolbox
-    return Toolbox(tools=[]).get_tool_definition()
+    return Toolbox.get_tool_definition()
 
 
 _toolbox_instance = None
 
 registry.register(
-    name="toolbox",
-    toolset="toolbox",
+    name=GATEWAY_TOOL_NAME,
+    toolset=GATEWAY_TOOL_NAME,
     schema=_get_schema(),
     handler=toolbox_handler,
-    check_fn=check_toolbox_requirements,
+    check_fn=is_available,
     emoji="🧰",
 )

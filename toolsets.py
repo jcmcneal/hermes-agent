@@ -25,6 +25,11 @@ Usage:
 
 from typing import List, Dict, Any, Set, Optional
 
+try:
+    from toolbox_gateway import GATEWAY_TOOL_NAME
+except ImportError:
+    GATEWAY_TOOL_NAME = "toolbox"
+
 
 # Shared tool list for CLI and all messaging platform toolsets.
 # Edit this once to update all platforms simultaneously.
@@ -169,7 +174,7 @@ TOOLSETS = {
             "The LLM uses toolbox list/explain/run to find and invoke infrequently-needed "
             "tools instead of bloating the system prompt with all their schemas."
         ),
-        "tools": ["toolbox"],
+        "tools": [GATEWAY_TOOL_NAME],
         "includes": []
     },
 

@@ -144,17 +144,25 @@ def get_skin_tool_prefix() -> str:
     return "┊"
 
 
-def resolve_display_tool_name(tool_name: str, args: dict | None = None) -> str:
-    """Return the tool name used for display (emoji, preview, completion).
+def _unwrap_for_display(tool_name: str, args: dict) -> tuple[str, dict] | None:
+    """If tool_name is a gateway wrapping an inner call, return (inner_name, inner_args).
 
-    For ``toolbox run`` calls, returns the inner tool name so the display
-    renders as the actual tool being called rather than as "toolbox".
+    Returns None if the call should be displayed as ``tool_name`` itself
+    (either it's not a gateway, or the gateway command isn't a ``run``).
+
+    The subject annotation is preserved on the returned args under the
+    ``_subject`` key so callers can append it after rendering.
     """
-    if tool_name == "toolbox" and args and args.get("command") == "run":
-        inner = args.get("toolName", "")
-        if inner:
-            return inner
-    return tool_name
+    from toolbox_gateway import unwrap_gateway_call, GATEWAY_TOOL_NAME
+    if tool_name != GATEWAY_TOOL_NAME:
+        return None
+    inner_name, inner_args = unwrap_gateway_call(tool_name, args)
+    if inner_name == tool_name:
+        return None
+    if args.get("subject"):
+        inner_args = dict(inner_args or {})
+        inner_args["_subject"] = args["subject"]
+    return inner_name, inner_args
 
 
 def get_tool_emoji(tool_name: str, default: str = "\u26a1") -> str:
@@ -546,20 +554,21 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
             preview = name
         return _truncate_preview(preview, max_len) if preview else None
 
+    # Gateway tools (e.g. toolbox) wrap inner tools. Delegate preview to
+    # the inner tool, with the toolbox subject appended as a trailing
+    # annotation.
+    if (unwrapped := _unwrap_for_display(tool_name, args)):
+        inner_name, inner_args = unwrapped
+        subject = inner_args.pop("_subject", "")
+        inner = build_tool_preview(inner_name, inner_args or {}, max_len=max_len)
+        if subject:
+            inner = f"{inner}  {subject}" if inner else subject
+        return inner
     if tool_name == "toolbox":
+        # Non-run commands (list/explain/hints) get their own preview
         command = args.get("command", "")
-        subject = args.get("subject", "")
-        tool_target = args.get("toolName", "")
-        inner_args = args.get("args", {})
-        # For "run", delegate display to the inner tool, then append subject
-        if command == "run" and tool_target:
-            inner = build_tool_preview(tool_target, inner_args or {}, max_len=max_len)
-            subject = args.get("subject", "")
-            if subject:
-                inner = f"{inner}  {subject}" if inner else subject
-            return inner
         if command == "explain":
-            names = args.get("toolNames") or ([tool_target] if tool_target else [])
+            names = args.get("toolNames") or ([args.get("toolName", "")] if args.get("toolName") else [])
             if names:
                 return f"explain {', '.join(names) if isinstance(names, list) else str(names)}"
         if command == "list":
@@ -1339,23 +1348,22 @@ def _get_cute_tool_message(
             return line
         return f"{line}{failure_suffix}"
 
+    # Gateway tools (e.g. toolbox) wrap inner tools. Delegate to the
+    # inner tool's cute message, with the subject appended before the
+    # trailing duration.
+    if (unwrapped := _unwrap_for_display(tool_name, args)):
+        inner_name, inner_args = unwrapped
+        subject = inner_args.pop("_subject", "")
+        inner_msg = get_cute_tool_message(inner_name, inner_args or {}, duration, result=result)
+        if subject:
+            suffix = f"  {dur}"
+            if inner_msg.endswith(suffix):
+                inner_msg = inner_msg[: -len(suffix)] + f"  {subject}{suffix}"
+        return inner_msg
     if tool_name == "toolbox":
         command = args.get("command", "")
-        tool_target = args.get("toolName", "")
-        inner_args = args.get("args", {})
-        # For "run", delegate display to the inner tool, then append the
-        # toolbox subject (the LLM's brief intent) as a trailing annotation.
-        if command == "run" and tool_target:
-            inner_msg = get_cute_tool_message(tool_target, inner_args or {}, duration, result=result)
-            subject = args.get("subject", "")
-            if subject:
-                # Insert subject before the trailing "  {dur}" suffix
-                suffix = f"  {dur}"
-                if inner_msg.endswith(suffix):
-                    inner_msg = inner_msg[: -len(suffix)] + f"  {subject}{suffix}"
-            return inner_msg
         if command == "explain":
-            names = args.get("toolNames", []) or ([tool_target] if tool_target else [])
+            names = args.get("toolNames", []) or ([args.get("toolName", "")] if args.get("toolName") else [])
             label = ", ".join(names) if isinstance(names, list) else str(names)
             return _wrap(f"┊ 🧰 explain   {_trunc(label, 35)}  {dur}")
         if command == "list":

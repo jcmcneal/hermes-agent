@@ -21,32 +21,18 @@ from tools.registry import registry
 logger = logging.getLogger(__name__)
 
 
-def _get_toolbox():
-    """Lazy-init the Toolbox singleton with all registry tools and SQLite hints."""
-    global _toolbox_instance
-    if _toolbox_instance is None:
-        from hermes_constants import get_hermes_home
-
-        hint_db = get_hermes_home() / "toolbox_hints.db"
-        hint_store = SQLiteHintStore(path=str(hint_db))
-
-        definitions = [
-            {
-                "name": entry.name,
-                "description": entry.description or entry.schema.get("description", ""),
-                "schema": entry.schema.get("parameters", {}),
-            }
-            for entry in registry._snapshot_entries()
-            if entry.name != GATEWAY_TOOL_NAME
-            and (not entry.check_fn or entry.check_fn())
-        ]
-
-        _toolbox_instance = Toolbox.from_definitions(
-            definitions=definitions,
-            dispatcher=_dispatch_tool,
-            hint_store=hint_store,
-        )
-    return _toolbox_instance
+def _tool_definitions():
+    """Return the registry's tool list in toolbox-compatible format."""
+    return [
+        {
+            "name": entry.name,
+            "description": entry.description or entry.schema.get("description", ""),
+            "schema": entry.schema.get("parameters", {}),
+        }
+        for entry in registry._snapshot_entries()
+        if entry.name != GATEWAY_TOOL_NAME
+        and (not entry.check_fn or entry.check_fn())
+    ]
 
 
 def _dispatch_tool(name: str, args: dict) -> dict:
@@ -60,30 +46,27 @@ def _dispatch_tool(name: str, args: dict) -> dict:
     return result
 
 
-def _reset_toolbox():
-    """Force re-initialization on next call (tools may have changed)."""
+def _get_toolbox():
+    """Lazy-init the Toolbox singleton, with tools fetched lazily from the registry."""
     global _toolbox_instance
-    _toolbox_instance = None
+    if _toolbox_instance is None:
+        from hermes_constants import get_hermes_home
+        hint_db = get_hermes_home() / "toolbox_hints.db"
+        hint_store = SQLiteHintStore(path=str(hint_db))
+        _toolbox_instance = Toolbox.from_provider(
+            provider=_tool_definitions,
+            dispatcher=_dispatch_tool,
+            hint_store=hint_store,
+        )
+    return _toolbox_instance
 
 
 def toolbox_handler(args: dict, **kwargs) -> str:
     """Handle toolbox tool calls by dispatching to the toolbox-gateway library."""
     try:
-        _reset_toolbox()
         tb = _get_toolbox()
-        result = tb.handle(
-            command=args.get("command", ""),
-            toolNames=args.get("toolNames"),
-            toolName=args.get("toolName"),
-            subject=args.get("subject"),
-            args=args.get("args", {}),
-            format=args.get("format"),
-            method=args.get("method"),
-            category=args.get("category"),
-            key=args.get("key"),
-            hint=args.get("hint"),
-            mcp=args.get("mcp"),
-        )
+        tb.refresh()  # pick up any newly registered tools
+        result = tb.handle_args(args)
         return json.dumps(result.to_dict() if hasattr(result, "to_dict") else result)
     except Exception as e:
         logger.exception("Toolbox handler error: %s", e)

@@ -26,9 +26,14 @@ Usage:
 from typing import List, Dict, Any, Set, Optional
 
 try:
-    from toolbox_gateway import GATEWAY_TOOL_NAME
+    from toolbox_gateway import GATEWAY_TOOL_NAME, TOOLSET_DEFINITION
 except ImportError:
     GATEWAY_TOOL_NAME = "toolbox"
+    TOOLSET_DEFINITION = {
+        "name": "toolbox",
+        "description": "Toolbox gateway — single root tool for all tool interactions.",
+        "tools": ["toolbox"],
+    }
 
 
 # Shared tool list for CLI and all messaging platform toolsets.
@@ -168,14 +173,10 @@ TOOLSETS = {
         "includes": []
     },
     
-    "toolbox": {
-        "description": (
-            "Toolbox gateway \u2014 collapse niche tools into a single discovery tool. "
-            "The LLM uses toolbox list/explain/run to find and invoke infrequently-needed "
-            "tools instead of bloating the system prompt with all their schemas."
-        ),
-        "tools": [GATEWAY_TOOL_NAME],
-        "includes": []
+    TOOLSET_DEFINITION["name"]: {
+        "description": TOOLSET_DEFINITION["description"],
+        "tools": TOOLSET_DEFINITION["tools"],
+        "includes": [],
     },
 
     "moa": {

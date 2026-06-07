@@ -144,27 +144,6 @@ def get_skin_tool_prefix() -> str:
     return "┊"
 
 
-def _unwrap_for_display(tool_name: str, args: dict) -> tuple[str, dict] | None:
-    """If tool_name is a gateway wrapping an inner call, return (inner_name, inner_args).
-
-    Returns None if the call should be displayed as ``tool_name`` itself
-    (either it's not a gateway, or the gateway command isn't a ``run``).
-
-    The subject annotation is preserved on the returned args under the
-    ``_subject`` key so callers can append it after rendering.
-    """
-    from toolbox_gateway import unwrap_gateway_call, GATEWAY_TOOL_NAME
-    if tool_name != GATEWAY_TOOL_NAME:
-        return None
-    inner_name, inner_args = unwrap_gateway_call(tool_name, args)
-    if inner_name == tool_name:
-        return None
-    if args.get("subject"):
-        inner_args = dict(inner_args or {})
-        inner_args["_subject"] = args["subject"]
-    return inner_name, inner_args
-
-
 def get_tool_emoji(tool_name: str, default: str = "\u26a1") -> str:
     """Get the display emoji for a tool.
 
@@ -557,25 +536,18 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
     # Gateway tools (e.g. toolbox) wrap inner tools. Delegate preview to
     # the inner tool, with the toolbox subject appended as a trailing
     # annotation.
-    if (unwrapped := _unwrap_for_display(tool_name, args)):
-        inner_name, inner_args = unwrapped
-        subject = inner_args.pop("_subject", "")
+    from toolbox_gateway import unwrap_with_subject
+    inner_name, inner_args, _subject = unwrap_with_subject(tool_name, args or {})
+    if inner_name != tool_name:
         inner = build_tool_preview(inner_name, inner_args or {}, max_len=max_len)
-        if subject:
-            inner = f"{inner}  {subject}" if inner else subject
+        if _subject:
+            inner = f"{inner}  {_subject}" if inner else _subject
         return inner
     if tool_name == "toolbox":
-        # Non-run commands (list/explain/hints) get their own preview
-        command = args.get("command", "")
-        if command == "explain":
-            names = args.get("toolNames") or ([args.get("toolName", "")] if args.get("toolName") else [])
-            if names:
-                return f"explain {', '.join(names) if isinstance(names, list) else str(names)}"
-        if command == "list":
-            return "list tools"
-        if command == "hints":
-            return "read hints"
-        return command or None
+        # Non-run commands (list/explain/hints) get their own preview,
+        # formatted by the package.
+        from toolbox_gateway import preview_for_command
+        return preview_for_command(args.get("command", ""), args)
 
     key = primary_args.get(tool_name)
     if not key:
@@ -1351,28 +1323,22 @@ def _get_cute_tool_message(
     # Gateway tools (e.g. toolbox) wrap inner tools. Delegate to the
     # inner tool's cute message, with the subject appended before the
     # trailing duration.
-    if (unwrapped := _unwrap_for_display(tool_name, args)):
-        inner_name, inner_args = unwrapped
-        subject = inner_args.pop("_subject", "")
+    from toolbox_gateway import unwrap_with_subject
+    inner_name, inner_args, _subject = unwrap_with_subject(tool_name, args or {})
+    if inner_name != tool_name:
         inner_msg = get_cute_tool_message(inner_name, inner_args or {}, duration, result=result)
-        if subject:
+        if _subject:
             suffix = f"  {dur}"
             if inner_msg.endswith(suffix):
-                inner_msg = inner_msg[: -len(suffix)] + f"  {subject}{suffix}"
+                inner_msg = inner_msg[: -len(suffix)] + f"  {_subject}{suffix}"
         return inner_msg
     if tool_name == "toolbox":
+        # Non-run commands: format with package helper, return 🧰 line
+        from toolbox_gateway import detail_for_command, label_for_command
         command = args.get("command", "")
-        if command == "explain":
-            names = args.get("toolNames", []) or ([args.get("toolName", "")] if args.get("toolName") else [])
-            label = ", ".join(names) if isinstance(names, list) else str(names)
-            return _wrap(f"┊ 🧰 explain   {_trunc(label, 35)}  {dur}")
-        if command == "list":
-            return _wrap(f"┊ 🧰 list      tools  {dur}")
-        if command == "hints":
-            method = args.get("method", "READ")
-            verb = "browse" if method == "READ" else method.lower()
-            return _wrap(f"┊ 🧰 hints     {verb}  {dur}")
-        return _wrap(f"┊ 🧰 {command[:9]:9} {dur}")
+        label = label_for_command(command, args)
+        detail = detail_for_command(command, args) or command
+        return _wrap(f"┊ 🧰 {label:9} {detail}  {dur}")
     if tool_name == "web_search":
         return _wrap(f"┊ 🔍 search    {_trunc(args.get('query', ''), 42)}  {dur}")
     if tool_name == "web_extract":

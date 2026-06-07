@@ -451,15 +451,14 @@ def _compute_tool_definitions(
     available_tool_names = {t["function"]["name"] for t in filtered_tools}
 
     # ── Toolbox gateway: collapse all tools into a single definition ──
-    # When the toolbox toolset is enabled and the toolbox-gateway package
-    # is installed, ALL other tool schemas are removed from the prompt.
-    # The LLM discovers tools at runtime via toolbox list → explain → run,
-    # replacing ~16K tokens of individual schemas with a single ~500-token
-    # definition.
-    from toolbox_gateway import GATEWAY_TOOL_NAME, is_available
-    if GATEWAY_TOOL_NAME in available_tool_names and is_available():
-        filtered_tools = [t for t in filtered_tools if t["function"]["name"] == GATEWAY_TOOL_NAME]
-        available_tool_names = {GATEWAY_TOOL_NAME}
+    # When the toolbox toolset is enabled, ALL other tool schemas are removed
+    # from the prompt. The LLM discovers tools at runtime via
+    # toolbox list → explain → run, replacing ~16K tokens of individual
+    # schemas with a single ~500-token definition.
+    from toolbox_gateway import filter_to_gateway_only, should_collapse_to_gateway
+    if should_collapse_to_gateway(available_tool_names):
+        filtered_tools = filter_to_gateway_only(filtered_tools)
+        available_tool_names = {t.get("function", t).get("name") for t in filtered_tools}
         if not quiet_mode:
             logger.info(
                 "Toolbox: collapsed %d tools into single gateway definition",

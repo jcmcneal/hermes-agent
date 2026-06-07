@@ -28,9 +28,9 @@ from agent.display import (
     get_cute_tool_message as _get_cute_tool_message_impl,
     get_tool_emoji as _get_tool_emoji,
     redact_tool_args_for_display as _redact_tool_args_for_display,
-    _unwrap_for_display,
     _detect_tool_failure,
 )
+from toolbox_gateway import unwrap_with_subject
 from agent.tool_guardrails import ToolGuardrailDecision
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
@@ -1400,7 +1400,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             spinner = None
             if agent._should_emit_quiet_tool_messages():
                 face = random.choice(KawaiiSpinner.get_waiting_faces())
-                _display_name, _ = _unwrap_for_display(function_name, function_args) or (function_name, None)
+                _display_name, _, _ = unwrap_with_subject(function_name, function_args or {})
                 emoji = _get_tool_emoji(_display_name)
                 display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
                 preview = _build_tool_preview(_display_name, display_args) or _display_name
@@ -1435,7 +1435,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             spinner = None
             if agent._should_emit_quiet_tool_messages() and agent._should_start_quiet_spinner():
                 face = random.choice(KawaiiSpinner.get_waiting_faces())
-                _display_name, _ = _unwrap_for_display(function_name, function_args) or (function_name, None)
+                _display_name, _, _ = unwrap_with_subject(function_name, function_args or {})
                 emoji = _get_tool_emoji(_display_name)
                 display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
                 preview = _build_tool_preview(_display_name, display_args) or _display_name
@@ -1468,7 +1468,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             spinner = None
             if agent._should_emit_quiet_tool_messages() and agent._should_start_quiet_spinner():
                 face = random.choice(KawaiiSpinner.get_waiting_faces())
-                _display_name, _ = _unwrap_for_display(function_name, function_args) or (function_name, None)
+                _display_name, _, _ = unwrap_with_subject(function_name, function_args or {})
                 emoji = _get_tool_emoji(_display_name)
                 display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
                 preview = _build_tool_preview(_display_name, display_args) or _display_name

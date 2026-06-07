@@ -1323,9 +1323,9 @@ def _get_cute_tool_message(
     # Gateway tools (e.g. toolbox) wrap inner tools. Delegate to the
     # inner tool's cute message, with the subject appended before the
     # trailing duration.
-    from toolbox_gateway import unwrap_with_subject
+    from toolbox_gateway import unwrap_with_subject, RESERVED_COMMAND_NAMES
     inner_name, inner_args, _subject = unwrap_with_subject(tool_name, args or {})
-    if inner_name != tool_name:
+    if inner_name != tool_name and inner_name not in RESERVED_COMMAND_NAMES:
         inner_msg = get_cute_tool_message(inner_name, inner_args or {}, duration, result=result)
         if _subject:
             suffix = f"  {dur}"

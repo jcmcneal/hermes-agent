@@ -139,7 +139,7 @@ dependencies = [
   # / pywin32 tree) ships only where it's actually used.
   "concurrent-log-handler==0.9.29; sys_platform == 'win32'",
   # Toolbox gateway — single-tool discovery pattern for LLM agents
-  "toolbox-gateway==0.3.0",
+  "toolbox-gateway==0.4.0",
 ]
 
 [project.optional-dependencies]

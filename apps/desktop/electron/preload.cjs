@@ -5,7 +5,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
   touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
   getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
-  openSessionWindow: sessionId => ipcRenderer.invoke('hermes:window:openSession', sessionId),
+  openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
   getBootProgress: () => ipcRenderer.invoke('hermes:boot-progress:get'),
   getConnectionConfig: profile => ipcRenderer.invoke('hermes:connection-config:get', profile),
   saveConnectionConfig: payload => ipcRenderer.invoke('hermes:connection-config:save', payload),
@@ -39,6 +39,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   watchPreviewFile: url => ipcRenderer.invoke('hermes:watchPreviewFile', url),
   stopPreviewFileWatch: id => ipcRenderer.invoke('hermes:stopPreviewFileWatch', id),
   setTitleBarTheme: payload => ipcRenderer.send('hermes:titlebar-theme', payload),
+  setNativeTheme: mode => ipcRenderer.send('hermes:native-theme', mode),
   setPreviewShortcutActive: active => ipcRenderer.send('hermes:previewShortcutActive', Boolean(active)),
   openExternal: url => ipcRenderer.invoke('hermes:openExternal', url),
   fetchLinkTitle: url => ipcRenderer.invoke('hermes:fetchLinkTitle', url),
@@ -80,6 +81,12 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     ipcRenderer.on('hermes:open-updates', listener)
     return () => ipcRenderer.removeListener('hermes:open-updates', listener)
   },
+  onDeepLink: callback => {
+    const listener = (_event, payload) => callback(payload)
+    ipcRenderer.on('hermes:deep-link', listener)
+    return () => ipcRenderer.removeListener('hermes:deep-link', listener)
+  },
+  signalDeepLinkReady: () => ipcRenderer.invoke('hermes:deep-link-ready'),
   onWindowStateChanged: callback => {
     const listener = (_event, payload) => callback(payload)
     ipcRenderer.on('hermes:window-state-changed', listener)

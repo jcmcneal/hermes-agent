@@ -2,8 +2,8 @@
 
 Covers:
 
-- All nine bundled plugins (brave-free, ddgs, searxng, exa, parallel,
-  tavily, firecrawl, ollama, xai) instantiate and self-report the expected
+- All eight bundled plugins (brave-free, ddgs, searxng, exa, parallel,
+  tavily, firecrawl, xai) instantiate and self-report the expected
   capabilities + ABC-derived defaults.
 - Each plugin's ``is_available()`` correctly reflects env-var presence.
 - The web_search_registry resolves an active provider in the documented
@@ -44,8 +44,8 @@ def _clear_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "FIRECRAWL_GATEWAY_URL",
         "TOOL_GATEWAY_DOMAIN",
         "TOOL_GATEWAY_USER_TOKEN",
-        "OLLAMA_API_KEY",
         "XAI_API_KEY",
+        "OLLAMA_API_KEY",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -196,11 +196,16 @@ class TestIsAvailable:
         assert p.is_available() is True
 
     def test_parallel_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """is_available() is key-based — it gates the registry's active-provider
+        walk/picker. (Keyless search/extract still work via the free MCP through
+        _get_backend's terminal default, independent of this flag.)
+        """
         _ensure_plugins_loaded()
         from agent.web_search_registry import get_provider
 
         p = get_provider("parallel")
         assert p is not None
+        monkeypatch.delenv("PARALLEL_API_KEY", raising=False)
         assert p.is_available() is False
         monkeypatch.setenv("PARALLEL_API_KEY", "real")
         assert p.is_available() is True
@@ -238,16 +243,6 @@ class TestIsAvailable:
         # Truthy or falsy, just must not raise.
         _ = bool(p.is_available())
 
-    def test_ollama_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _ensure_plugins_loaded()
-        from agent.web_search_registry import get_provider
-
-        p = get_provider("ollama")
-        assert p is not None
-        assert p.is_available() is False
-        monkeypatch.setenv("OLLAMA_API_KEY", "real")
-        assert p.is_available() is True
-
     def test_xai_requires_api_key_or_oauth(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """xAI needs XAI_API_KEY or OAuth tokens in auth.json."""
         _ensure_plugins_loaded()
@@ -257,6 +252,16 @@ class TestIsAvailable:
         assert p is not None
         assert p.is_available() is False  # no XAI_API_KEY, no auth.json
         monkeypatch.setenv("XAI_API_KEY", "real")
+        assert p.is_available() is True
+
+    def test_ollama_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_provider
+
+        p = get_provider("ollama")
+        assert p is not None
+        assert p.is_available() is False
+        monkeypatch.setenv("OLLAMA_API_KEY", "real")
         assert p.is_available() is True
 
 
@@ -466,17 +471,33 @@ class TestErrorResponseShapes:
         assert "error" in result[0]
         assert result[0]["url"] == "https://example.com"
 
-    def test_parallel_extract_returns_per_url_errors_when_unconfigured(self) -> None:
+    def test_parallel_extract_keyless_uses_mcp_web_fetch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without a key, extract routes to the free MCP web_fetch tool rather
+        than erroring. The MCP transport is mocked so the test stays offline."""
         _ensure_plugins_loaded()
         from agent.web_search_registry import get_provider
+        import plugins.web.parallel.provider as parallel_provider
+
+        monkeypatch.delenv("PARALLEL_API_KEY", raising=False)
+        captured = {}
+
+        def _fake_fetch(urls, api_key):
+            captured["urls"] = list(urls)
+            captured["api_key"] = api_key
+            return [{"url": urls[0], "title": "Example", "content": "body",
+                     "raw_content": "body", "metadata": {"sourceURL": urls[0]}}]
+
+        monkeypatch.setattr(parallel_provider, "_mcp_web_fetch", _fake_fetch)
 
         p = get_provider("parallel")
         assert p is not None
         result = asyncio.run(p.extract(["https://example.com"]))
         assert isinstance(result, list)
-        assert len(result) == 1
-        assert "error" in result[0]
         assert result[0]["url"] == "https://example.com"
+        assert result[0]["content"] == "body"
+        assert captured == {"urls": ["https://example.com"], "api_key": None}
 
     def test_firecrawl_extract_returns_per_url_errors_when_unconfigured(self) -> None:
         _ensure_plugins_loaded()
@@ -540,74 +561,3 @@ class TestErrorResponseShapes:
         assert isinstance(result, dict)
         assert result.get("success") is False
         assert "error" in result
-
-# ---------------------------------------------------------------------------
-# Ollama response normalization
-# ---------------------------------------------------------------------------
-
-
-class TestOllamaNormalization:
-    """Ollama response shapes are normalized correctly."""
-
-    def test_normalizes_standard_results(self) -> None:
-        from plugins.web.ollama.provider import _normalize_search_results
-
-        raw = {
-            "results": [
-                {"title": "A", "url": "https://a.com", "snippet": "desc A"},
-                {"title": "B", "url": "https://b.com", "snippet": "desc B"},
-            ]
-        }
-        result = _normalize_search_results(raw)
-        assert result["success"] is True
-        web = result["data"]["web"]
-        assert len(web) == 2
-        assert web[0]["title"] == "A"
-        assert web[0]["url"] == "https://a.com"
-
-    def test_normalizes_markdown_content_links(self) -> None:
-        from plugins.web.ollama.provider import _normalize_search_results
-
-        raw = {"content": "Check [Python](https://python.org) and [Rust](https://rust-lang.org)"}
-        result = _normalize_search_results(raw)
-        assert result["success"] is True
-        web = result["data"]["web"]
-        assert len(web) == 2
-        assert web[0]["title"] == "Python"
-        assert web[0]["url"] == "https://python.org"
-
-    def test_normalizes_json_string_content(self) -> None:
-        import json
-        from plugins.web.ollama.provider import _normalize_search_results
-
-        inner = [{"title": "X", "url": "https://x.io"}]
-        raw = {"content": json.dumps(inner)}
-        result = _normalize_search_results(raw)
-        assert result["success"] is True
-        web = result["data"]["web"]
-        assert len(web) == 1
-        assert web[0]["title"] == "X"
-
-    def test_normalizes_fetch_result_dict(self) -> None:
-        from plugins.web.ollama.provider import _normalize_fetch_result
-
-        raw = {"content": "Hello", "title": "Page", "metadata": {"sourceURL": "https://example.com"}}
-        result = _normalize_fetch_result(raw, fallback_url="https://example.com")
-        assert result["url"] == "https://example.com"
-        assert result["title"] == "Page"
-        assert result["content"] == "Hello"
-        assert result["metadata"]["sourceURL"] == "https://example.com"
-
-    def test_fetch_result_falls_back_to_text_key(self) -> None:
-        from plugins.web.ollama.provider import _normalize_fetch_result
-
-        raw = {"text": "Body text", "title": "T"}
-        result = _normalize_fetch_result(raw, fallback_url="https://example.com")
-        assert result["content"] == "Body text"
-
-    def test_search_results_cap_at_ten(self) -> None:
-        from plugins.web.ollama.provider import _normalize_search_results
-
-        raw = {"results": [{"title": str(i), "url": f"https://{i}.com"} for i in range(25)]}
-        result = _normalize_search_results(raw)
-        assert len(result["data"]["web"]) == 10

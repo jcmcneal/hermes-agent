@@ -22,15 +22,26 @@ const http = require('node:http')
 const https = require('node:https')
 const net = require('node:net')
 const path = require('node:path')
-const { fileURLToPath, pathToFileURL } = require('node:url')
+const { pathToFileURL } = require('node:url')
 const { execFileSync, spawn } = require('node:child_process')
 const { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } = require('./bootstrap-platform.cjs')
 const { runBootstrap } = require('./bootstrap-runner.cjs')
-const { buildSessionWindowUrl, createSessionWindowRegistry } = require('./session-windows.cjs')
+const {
+  buildSessionWindowUrl,
+  createSessionWindowRegistry,
+  SESSION_WINDOW_MIN_HEIGHT,
+  SESSION_WINDOW_MIN_WIDTH
+} = require('./session-windows.cjs')
 const { canImportHermesCli, verifyHermesCli } = require('./backend-probes.cjs')
 const { probeGatewayWebSocket } = require('./gateway-ws-probe.cjs')
+const { adoptServedDashboardToken } = require('./dashboard-token.cjs')
+const { PortPool } = require('./port-pool.cjs')
 const { serializeJsonBody, setJsonRequestHeaders } = require('./oauth-net-request.cjs')
 const { fetchMarketplaceThemes, searchMarketplaceThemes } = require('./vscode-marketplace.cjs')
+const { buildDesktopBackendEnv } = require('./backend-env.cjs')
+const { readDirForIpc } = require('./fs-read-dir.cjs')
+const { gitRootForIpc } = require('./git-root.cjs')
+const { OFFICIAL_REPO_HTTPS_URL, isOfficialSshRemote } = require('./update-remote.cjs')
 const {
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
@@ -61,6 +72,7 @@ const {
   TEXT_PREVIEW_SOURCE_MAX_BYTES,
   encryptDesktopSecret: encryptDesktopSecretStrict,
   resolveReadableFileForIpc,
+  resolveRequestedPathForIpc,
   resolveTimeoutMs
 } = require('./hardening.cjs')
 
@@ -86,6 +98,7 @@ try {
       nodePty = require(nodePtyDir)
     }
   } catch {
+    console.log(`[terminal] failed to load node-pty from path ${nodePtyDir}`)
     nodePty = null
     nodePtyDir = null
   }
@@ -100,6 +113,10 @@ if (USER_DATA_OVERRIDE) {
 
 const PORT_FLOOR = 9120
 const PORT_CEILING = 9199
+// In-process port reservations that close the pickPort() TOCTOU window where
+// two concurrent backend spawns could be handed the same port. See
+// port-pool.cjs for the full rationale.
+const portPool = new PortPool(PORT_FLOOR, PORT_CEILING)
 const DEV_SERVER = process.env.HERMES_DESKTOP_DEV_SERVER
 const IS_PACKAGED = app.isPackaged
 const IS_MAC = process.platform === 'darwin'
@@ -333,8 +350,56 @@ const APP_ICON_PATHS = [
 let rendererTitleBarTheme = null
 const terminalSessions = new Map()
 
+// Force the NATIVE window appearance (vibrancy material, titlebar, the
+// pre-first-paint window background) to follow the APP theme instead of the
+// OS appearance. With `vibrancy` set, macOS paints an NSVisualEffectView that
+// tracks the window's effective appearance and ignores `backgroundColor` —
+// so a dark-themed app on a light-mode Mac flashes a white material on every
+// new window until the renderer covers it. The renderer reports its mode via
+// 'hermes:native-theme' ('dark' | 'light' | 'system'); we pin
+// nativeTheme.themeSource to it and persist the value so cold launches paint
+// correctly before the renderer has even loaded.
+const NATIVE_THEME_CONFIG_PATH = path.join(app.getPath('userData'), 'native-theme.json')
+const THEME_SOURCES = new Set(['dark', 'light', 'system'])
+
+function readPersistedThemeSource() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(NATIVE_THEME_CONFIG_PATH, 'utf8'))
+
+    if (parsed && THEME_SOURCES.has(parsed.themeSource)) {
+      return parsed.themeSource
+    }
+  } catch {
+    // Missing / malformed → follow the OS like a fresh install.
+  }
+
+  return 'system'
+}
+
+function writePersistedThemeSource(mode) {
+  try {
+    fs.mkdirSync(path.dirname(NATIVE_THEME_CONFIG_PATH), { recursive: true })
+    fs.writeFileSync(NATIVE_THEME_CONFIG_PATH, JSON.stringify({ themeSource: mode }, null, 2), 'utf8')
+  } catch (error) {
+    rememberLog(`[theme] write native theme failed: ${error.message}`)
+  }
+}
+
+nativeTheme.themeSource = readPersistedThemeSource()
+
 function isHexColor(value) {
   return typeof value === 'string' && /^#[0-9a-f]{6}$/i.test(value)
+}
+
+// Background color to paint a window with BEFORE its renderer loads, so a new
+// (or reopened) window doesn't flash white/light in dark mode. Prefer the theme
+// the renderer last reported; fall back to the OS preference on first launch.
+function getWindowBackgroundColor() {
+  if (rendererTitleBarTheme && isHexColor(rendererTitleBarTheme.background)) {
+    return rendererTitleBarTheme.background
+  }
+
+  return nativeTheme.shouldUseDarkColors ? '#111111' : '#f7f7f7'
 }
 
 function getTitleBarOverlayOptions() {
@@ -726,7 +791,7 @@ function openExternalUrl(rawUrl) {
   if (parsed.protocol === 'file:') {
     let localPath
     try {
-      localPath = fileURLToPath(parsed.toString())
+      localPath = resolveRequestedPathForIpc(parsed.toString(), { purpose: 'Open external file' })
     } catch {
       return false
     }
@@ -1149,10 +1214,14 @@ function findSystemPython() {
   if (pyExe) {
     for (const version of SUPPORTED_VERSIONS) {
       try {
-        const out = execFileSync(pyExe, [`-${version}`, '-c', 'import sys; print(sys.executable)'], hiddenWindowsChildOptions({
-          encoding: 'utf8',
-          stdio: ['ignore', 'pipe', 'ignore']
-        }))
+        const out = execFileSync(
+          pyExe,
+          [`-${version}`, '-c', 'import sys; print(sys.executable)'],
+          hiddenWindowsChildOptions({
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore']
+          })
+        )
         const candidate = out.trim()
         if (candidate && fileExists(candidate)) return candidate
       } catch {
@@ -1287,11 +1356,15 @@ function resolveUpdateRoot() {
 
 function runGit(args, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(resolveGitBinary(), IS_WINDOWS ? ['-c', 'windows.appendAtomically=false', ...args] : args, hiddenWindowsChildOptions({
-      cwd: options.cwd,
-      env: { ...process.env, ...(options.env || {}), GIT_TERMINAL_PROMPT: '0' },
-      stdio: ['ignore', 'pipe', 'pipe']
-    }))
+    const child = spawn(
+      resolveGitBinary(),
+      IS_WINDOWS ? ['-c', 'windows.appendAtomically=false', ...args] : args,
+      hiddenWindowsChildOptions({
+        cwd: options.cwd,
+        env: { ...process.env, ...(options.env || {}), GIT_TERMINAL_PROMPT: '0' },
+        stdio: ['ignore', 'pipe', 'pipe']
+      })
+    )
 
     let stdout = ''
     let stderr = ''
@@ -1312,6 +1385,11 @@ function runGit(args, options = {}) {
 
 const firstLine = text => (text || '').split('\n').find(Boolean) || ''
 
+async function getOriginUrl(updateRoot) {
+  const origin = await runGit(['remote', 'get-url', 'origin'], { cwd: updateRoot })
+  return origin.code === 0 ? origin.stdout.trim() : ''
+}
+
 function emitUpdateProgress(payload) {
   const merged = { stage: 'idle', message: '', percent: null, error: null, ...payload, at: Date.now() }
   rememberLog(`[updates] ${merged.stage}: ${merged.message || merged.error || ''}`)
@@ -1331,7 +1409,9 @@ async function resolveHealedBranch(updateRoot, branch) {
     return branch || 'main'
   }
 
-  const probe = await runGit(['ls-remote', '--exit-code', '--heads', 'origin', branch], { cwd: updateRoot })
+  const originUrl = await getOriginUrl(updateRoot)
+  const remote = isOfficialSshRemote(originUrl) ? OFFICIAL_REPO_HTTPS_URL : 'origin'
+  const probe = await runGit(['ls-remote', '--exit-code', '--heads', remote, branch], { cwd: updateRoot })
   if (probe.code !== 2) {
     return branch
   }
@@ -1359,6 +1439,40 @@ async function checkUpdates() {
   }
 
   branch = await resolveHealedBranch(updateRoot, branch)
+  const originUrl = await getOriginUrl(updateRoot)
+  if (isOfficialSshRemote(originUrl)) {
+    const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
+    const [currentSha, target, dirtyStr, currentBranch] = await Promise.all([
+      git(['rev-parse', 'HEAD']),
+      runGit(['ls-remote', OFFICIAL_REPO_HTTPS_URL, `refs/heads/${branch}`], { cwd: updateRoot }),
+      git(['status', '--porcelain']),
+      git(['rev-parse', '--abbrev-ref', 'HEAD'])
+    ])
+    const targetSha = firstLine(target.stdout).split(/\s+/)[0] || ''
+    if (target.code !== 0 || !targetSha) {
+      return {
+        supported: true,
+        branch,
+        error: 'fetch-failed',
+        message: firstLine(target.stderr) || 'git ls-remote failed.',
+        hermesRoot: updateRoot,
+        fetchedAt: Date.now()
+      }
+    }
+    return {
+      supported: true,
+      branch,
+      currentBranch,
+      behind: currentSha && currentSha === targetSha ? 0 : 1,
+      currentSha,
+      targetSha,
+      commits: [],
+      dirty: dirtyStr.length > 0,
+      hermesRoot: updateRoot,
+      fetchedAt: Date.now()
+    }
+  }
+
   const fetched = await runGit(['fetch', '--quiet', 'origin', branch], { cwd: updateRoot })
   if (fetched.code !== 0) {
     return {
@@ -1687,11 +1801,15 @@ function runStreamedUpdate(command, args, { cwd, env, stage } = {}) {
   return new Promise(resolve => {
     let child
     try {
-      child = spawn(command, args, hiddenWindowsChildOptions({
-        cwd,
-        env: { ...process.env, ...(env || {}) },
-        stdio: ['ignore', 'pipe', 'pipe']
-      }))
+      child = spawn(
+        command,
+        args,
+        hiddenWindowsChildOptions({
+          cwd,
+          env: { ...process.env, ...(env || {}) },
+          stdio: ['ignore', 'pipe', 'pipe']
+        })
+      )
     } catch (err) {
       resolve({ code: 1, error: err.message })
       return
@@ -2079,9 +2197,11 @@ function createPythonBackend(root, label, dashboardArgs, options = {}) {
     label,
     command: python,
     args: ['-m', 'hermes_cli.main', ...dashboardArgs],
-    env: {
-      PYTHONPATH: [root, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter)
-    },
+    env: buildDesktopBackendEnv({
+      hermesHome: HERMES_HOME,
+      pythonPathEntries: [root],
+      venvRoot: path.join(root, 'venv')
+    }),
     root,
     bootstrap: Boolean(options.bootstrap),
     shell: false
@@ -2100,9 +2220,11 @@ function createActiveBackend(dashboardArgs) {
     label: `Hermes at ${ACTIVE_HERMES_ROOT}`,
     command: fileExists(venvPython) ? venvPython : findSystemPython(),
     args: ['-m', 'hermes_cli.main', ...dashboardArgs],
-    env: {
-      PYTHONPATH: [ACTIVE_HERMES_ROOT, process.env.PYTHONPATH].filter(Boolean).join(path.delimiter)
-    },
+    env: buildDesktopBackendEnv({
+      hermesHome: HERMES_HOME,
+      pythonPathEntries: [ACTIVE_HERMES_ROOT],
+      venvRoot: VENV_ROOT
+    }),
     root: ACTIVE_HERMES_ROOT,
     bootstrap: true,
     shell: false
@@ -2404,10 +2526,11 @@ function isPortAvailable(port) {
 }
 
 async function pickPort() {
-  for (let port = PORT_FLOOR; port <= PORT_CEILING; port += 1) {
-    if (await isPortAvailable(port)) return port
+  const port = await portPool.reserve(isPortAvailable)
+  if (port === null) {
+    throw new Error(`No free localhost port in ${PORT_FLOOR}-${PORT_CEILING}`)
   }
-  throw new Error(`No free localhost port in ${PORT_FLOOR}-${PORT_CEILING}`)
+  return port
 }
 
 function fetchJson(url, token, options = {}) {
@@ -2833,10 +2956,10 @@ async function resourceBufferFromUrl(rawUrl) {
     const buffer = match[2] ? Buffer.from(encoded, 'base64') : Buffer.from(decodeURIComponent(encoded), 'utf8')
     return { buffer, mimeType }
   }
-  if (rawUrl.startsWith('file:')) {
-    const filePath = fileURLToPath(rawUrl)
-    const buffer = await fs.promises.readFile(filePath)
-    return { buffer, mimeType: mimeTypeForPath(filePath) }
+  if (/^file:/i.test(rawUrl)) {
+    const { resolvedPath } = await resolveReadableFileForIpc(rawUrl, { purpose: 'Image file' })
+    const buffer = await fs.promises.readFile(resolvedPath)
+    return { buffer, mimeType: mimeTypeForPath(resolvedPath) }
   }
 
   const parsed = new URL(rawUrl)
@@ -2914,11 +3037,13 @@ function expandUserPath(filePath) {
   return value
 }
 
-function previewFileTarget(rawTarget, baseDir) {
+async function previewFileTarget(rawTarget, baseDir) {
   const raw = String(rawTarget || '').trim()
   const base = baseDir ? path.resolve(expandUserPath(baseDir)) : resolveHermesCwd()
-  const filePath = raw.startsWith('file:') ? fileURLToPath(raw) : path.resolve(base, expandUserPath(raw))
-  let resolved = filePath
+  let resolved = resolveRequestedPathForIpc(/^file:/i.test(raw) ? raw : expandUserPath(raw), {
+    baseDir: base,
+    purpose: 'Preview target'
+  })
 
   if (directoryExists(resolved)) {
     resolved = path.join(resolved, 'index.html')
@@ -2928,6 +3053,8 @@ function previewFileTarget(rawTarget, baseDir) {
   if (!fileExists(resolved)) {
     return null
   }
+
+  ;({ resolvedPath: resolved } = await resolveReadableFileForIpc(resolved, { purpose: 'Preview target' }))
 
   const mimeType = mimeTypeForPath(resolved)
   const metadata = previewFileMetadata(resolved, mimeType)
@@ -2974,7 +3101,7 @@ function previewUrlTarget(rawTarget) {
   }
 }
 
-function normalizePreviewTarget(rawTarget, baseDir) {
+async function normalizePreviewTarget(rawTarget, baseDir) {
   const raw = String(rawTarget || '').trim()
 
   if (!raw) {
@@ -2986,20 +3113,15 @@ function normalizePreviewTarget(rawTarget, baseDir) {
       return previewUrlTarget(raw)
     }
 
-    return previewFileTarget(raw, baseDir)
+    return await previewFileTarget(raw, baseDir)
   } catch {
     return null
   }
 }
 
-function filePathFromPreviewUrl(rawUrl) {
-  const filePath = fileURLToPath(String(rawUrl || ''))
-
-  if (!fileExists(filePath)) {
-    throw new Error('Preview file is not readable')
-  }
-
-  return filePath
+async function filePathFromPreviewUrl(rawUrl) {
+  const { resolvedPath } = await resolveReadableFileForIpc(String(rawUrl || ''), { purpose: 'Preview file' })
+  return resolvedPath
 }
 
 function sendPreviewFileChanged(payload) {
@@ -3009,8 +3131,8 @@ function sendPreviewFileChanged(payload) {
   webContents.send('hermes:preview-file-changed', payload)
 }
 
-function watchPreviewFile(rawUrl) {
-  const filePath = filePathFromPreviewUrl(rawUrl)
+async function watchPreviewFile(rawUrl) {
+  const filePath = await filePathFromPreviewUrl(rawUrl)
   const watchDir = path.dirname(filePath)
   const targetName = path.basename(filePath)
   const id = crypto.randomBytes(12).toString('base64url')
@@ -4492,31 +4614,46 @@ async function spawnPoolBackend(profile, entry) {
   // --profile wins over the inherited HERMES_HOME env (see _apply_profile_override
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
   const dashboardArgs = ['--profile', profile, 'dashboard', '--no-open', '--host', '127.0.0.1', '--port', String(port)]
-  const backend = await ensureRuntime(resolveHermesBackend(dashboardArgs))
-  const hermesCwd = resolveHermesCwd()
-  const webDist = resolveWebDist()
+  let backend
+  let hermesCwd
+  let webDist
+  try {
+    backend = await ensureRuntime(resolveHermesBackend(dashboardArgs))
+    hermesCwd = resolveHermesCwd()
+    webDist = resolveWebDist()
+  } catch (error) {
+    // These run before the child exists / its exit handler is attached, so a
+    // throw here would otherwise leak the reservation and slowly exhaust the
+    // 9120-9199 range across switch cycles in one app session.
+    portPool.release(port)
+    throw error
+  }
 
   rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)
 
-  const child = spawn(backend.command, backend.args, hiddenWindowsChildOptions({
-    cwd: hermesCwd,
-    env: {
-      ...process.env,
-      HERMES_HOME,
-      ...backend.env,
-      // Pin the gateway's tool/terminal cwd to the same directory we chose for
-      // the child process. Inherited TERMINAL_CWD (or a stale config bridge)
-      // can still point at the install dir even when spawn cwd is home.
-      TERMINAL_CWD: hermesCwd,
-      HERMES_DASHBOARD_SESSION_TOKEN: token,
-      // Marks this dashboard backend as desktop-spawned so it runs the cron
-      // scheduler tick loop (the gateway isn't running under the app).
-      HERMES_DESKTOP: '1',
-      HERMES_WEB_DIST: webDist
-    },
-    shell: backend.shell,
-    stdio: ['ignore', 'pipe', 'pipe']
-  }))
+  const child = spawn(
+    backend.command,
+    backend.args,
+    hiddenWindowsChildOptions({
+      cwd: hermesCwd,
+      env: {
+        ...process.env,
+        HERMES_HOME,
+        ...backend.env,
+        // Pin the gateway's tool/terminal cwd to the same directory we chose for
+        // the child process. Inherited TERMINAL_CWD (or a stale config bridge)
+        // can still point at the install dir even when spawn cwd is home.
+        TERMINAL_CWD: hermesCwd,
+        HERMES_DASHBOARD_SESSION_TOKEN: token,
+        // Marks this dashboard backend as desktop-spawned so it runs the cron
+        // scheduler tick loop (the gateway isn't running under the app).
+        HERMES_DESKTOP: '1',
+        HERMES_WEB_DIST: webDist
+      },
+      shell: backend.shell,
+      stdio: ['ignore', 'pipe', 'pipe']
+    })
+  )
   entry.process = child
   entry.port = port
   entry.token = token
@@ -4532,11 +4669,13 @@ async function spawnPoolBackend(profile, entry) {
   child.once('error', error => {
     rememberLog(`Hermes backend for profile "${profile}" failed to start: ${error.message}`)
     backendPool.delete(profile)
+    portPool.release(port)
     rejectStart?.(error)
   })
   child.once('exit', (code, signal) => {
     rememberLog(`Hermes backend for profile "${profile}" exited (${signal || code})`)
     backendPool.delete(profile)
+    portPool.release(port)
     if (!ready) {
       rejectStart?.(
         new Error(`Hermes backend for profile "${profile}" exited before it became ready (${signal || code}).`)
@@ -4547,15 +4686,21 @@ async function spawnPoolBackend(profile, entry) {
   const baseUrl = `http://127.0.0.1:${port}`
   await Promise.race([waitForHermes(baseUrl, token), startFailed])
   ready = true
+  const authToken = await adoptServedDashboardToken(baseUrl, token, {
+    childAlive: () => child.exitCode === null && !child.killed,
+    label: `Hermes backend for profile "${profile}"`,
+    rememberLog
+  })
+  entry.token = authToken
 
   return {
     baseUrl,
     mode: 'local',
     source: 'local',
     authMode: 'token',
-    token,
+    token: authToken,
     profile,
-    wsUrl: `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(token)}`,
+    wsUrl: `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`,
     logs: hermesLog.slice(-80),
     ...getWindowState()
   }
@@ -4565,6 +4710,7 @@ function stopPoolBackend(profile) {
   const entry = backendPool.get(profile)
   if (!entry) return
   backendPool.delete(profile)
+  if (entry.port) portPool.release(entry.port)
   if (entry.process && !entry.process.killed) {
     try {
       entry.process.kill('SIGTERM')
@@ -4650,6 +4796,11 @@ async function startHermes() {
   }
   if (connectionPromise) return connectionPromise
 
+  // Hoisted so the outer .catch can release a port reserved by pickPort() when
+  // a throw (e.g. ensureRuntime failing) happens before the child's exit
+  // handler is attached. Stays null on the remote path (no port picked).
+  let reservedPort = null
+
   connectionPromise = (async () => {
     await advanceBootProgress('backend.resolve', 'Resolving Hermes backend', 8)
     // Resolve for the desktop's primary profile so a per-profile remote
@@ -4679,6 +4830,7 @@ async function startHermes() {
 
     await advanceBootProgress('backend.port', 'Finding an open local port', 16)
     const port = await pickPort()
+    reservedPort = port
     const token = crypto.randomBytes(32).toString('base64url')
     const dashboardArgs = ['dashboard', '--no-open', '--host', '127.0.0.1', '--port', String(port)]
     // Pin the desktop's chosen profile via the global --profile flag. This is
@@ -4698,30 +4850,34 @@ async function startHermes() {
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
     rememberLog(`Starting Hermes backend via ${backend.label}`)
 
-    hermesProcess = spawn(backend.command, backend.args, hiddenWindowsChildOptions({
-      cwd: hermesCwd,
-      env: {
-        ...process.env,
-        // Explicitly pin HERMES_HOME for the child so Python's get_hermes_home()
-        // resolves to the SAME location our resolveHermesHome() picked. Without
-        // this pin, Python falls back to ~/.hermes on every platform — fine on
-        // mac/linux (where our default matches), but on Windows our default is
-        // %LOCALAPPDATA%\hermes, which differs from C:\Users\<u>\.hermes.
-        // Mismatch would split config / sessions / .env / logs across two
-        // directories. install.ps1 sets HERMES_HOME via setx; the desktop
-        // can't reliably do that, so we set it inline for every spawn.
-        HERMES_HOME,
-        ...backend.env,
-        TERMINAL_CWD: hermesCwd,
-        HERMES_DASHBOARD_SESSION_TOKEN: token,
-        // Marks this dashboard backend as desktop-spawned so it runs the cron
-        // scheduler tick loop (the gateway isn't running under the app).
-        HERMES_DESKTOP: '1',
-        HERMES_WEB_DIST: webDist
-      },
-      shell: backend.shell,
-      stdio: ['ignore', 'pipe', 'pipe']
-    }))
+    hermesProcess = spawn(
+      backend.command,
+      backend.args,
+      hiddenWindowsChildOptions({
+        cwd: hermesCwd,
+        env: {
+          ...process.env,
+          // Explicitly pin HERMES_HOME for the child so Python's get_hermes_home()
+          // resolves to the SAME location our resolveHermesHome() picked. Without
+          // this pin, Python falls back to ~/.hermes on every platform — fine on
+          // mac/linux (where our default matches), but on Windows our default is
+          // %LOCALAPPDATA%\hermes, which differs from C:\Users\<u>\.hermes.
+          // Mismatch would split config / sessions / .env / logs across two
+          // directories. install.ps1 sets HERMES_HOME via setx; the desktop
+          // can't reliably do that, so we set it inline for every spawn.
+          HERMES_HOME,
+          ...backend.env,
+          TERMINAL_CWD: hermesCwd,
+          HERMES_DASHBOARD_SESSION_TOKEN: token,
+          // Marks this dashboard backend as desktop-spawned so it runs the cron
+          // scheduler tick loop (the gateway isn't running under the app).
+          HERMES_DESKTOP: '1',
+          HERMES_WEB_DIST: webDist
+        },
+        shell: backend.shell,
+        stdio: ['ignore', 'pipe', 'pipe']
+      })
+    )
 
     hermesProcess.stdout.on('data', rememberLog)
     hermesProcess.stderr.on('data', rememberLog)
@@ -4743,6 +4899,7 @@ async function startHermes() {
       )
       hermesProcess = null
       connectionPromise = null
+      portPool.release(port)
       sendBackendExit({ code: null, signal: null, error: error.message })
       rejectBackendStart?.(error)
     })
@@ -4750,6 +4907,7 @@ async function startHermes() {
       rememberLog(`Hermes backend exited (${signal || code})`)
       hermesProcess = null
       connectionPromise = null
+      portPool.release(port)
       sendBackendExit({ code, signal })
       if (!backendReady) {
         const message = `Hermes backend exited before it became ready (${signal || code}).`
@@ -4774,6 +4932,11 @@ async function startHermes() {
     await advanceBootProgress('backend.wait', 'Waiting for Hermes backend to become ready', 90)
     await Promise.race([waitForHermes(baseUrl, token), backendStartFailed])
     backendReady = true
+    const authToken = await adoptServedDashboardToken(baseUrl, token, {
+      // The exit/error handlers null hermesProcess when the child dies.
+      childAlive: () => hermesProcess !== null && hermesProcess.exitCode === null && !hermesProcess.killed,
+      rememberLog
+    })
     updateBootProgress({
       phase: 'backend.ready',
       message: 'Hermes backend is ready. Finalizing desktop startup',
@@ -4787,8 +4950,8 @@ async function startHermes() {
       mode: 'local',
       source: 'local',
       authMode: 'token',
-      token,
-      wsUrl: `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(token)}`,
+      token: authToken,
+      wsUrl: `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`,
       logs: hermesLog.slice(-80),
       ...getWindowState()
     }
@@ -4804,6 +4967,7 @@ async function startHermes() {
       { allowDecrease: true }
     )
     connectionPromise = null
+    portPool.release(reservedPort)
     throw error
   })
 
@@ -4851,21 +5015,28 @@ function focusWindow(win) {
 }
 
 // Open (or focus) a standalone window for a single chat session.
-function createSessionWindow(sessionId) {
+function createSessionWindow(sessionId, { watch = false } = {}) {
   return sessionWindows.openOrFocus(sessionId, () => {
     const icon = getAppIconPath()
     const win = new BrowserWindow({
-      width: 480,
-      height: 800,
-      minWidth: 420,
-      minHeight: 620,
+      width: SESSION_WINDOW_MIN_WIDTH,
+      height: SESSION_WINDOW_MIN_HEIGHT,
+      minWidth: SESSION_WINDOW_MIN_WIDTH,
+      minHeight: SESSION_WINDOW_MIN_HEIGHT,
       title: 'Hermes',
       titleBarStyle: 'hidden',
       titleBarOverlay: getTitleBarOverlayOptions(),
       trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
       vibrancy: IS_MAC ? 'sidebar' : undefined,
       icon,
-      backgroundColor: '#f7f7f7',
+      // Don't show until the renderer's first themed paint is ready. macOS
+      // `vibrancy` ignores `backgroundColor` and paints a translucent OS
+      // material (which follows the OS appearance, not the app theme), so a
+      // dark-themed app on a light-mode Mac flashes white until the renderer
+      // covers it. ready-to-show fires after the boot-time paint in
+      // themes/context.tsx, so the window appears already themed.
+      show: false,
+      backgroundColor: getWindowBackgroundColor(),
       webPreferences: {
         preload: path.join(__dirname, 'preload.cjs'),
         contextIsolation: true,
@@ -4880,6 +5051,10 @@ function createSessionWindow(sessionId) {
       win.setWindowButtonPosition?.(WINDOW_BUTTON_POSITION)
     }
 
+    win.once('ready-to-show', () => {
+      if (!win.isDestroyed()) win.show()
+    })
+
     win.on('will-enter-full-screen', () => sendWindowStateChanged(true))
     win.on('enter-full-screen', () => sendWindowStateChanged(true))
     win.on('will-leave-full-screen', () => sendWindowStateChanged(false))
@@ -4890,7 +5065,8 @@ function createSessionWindow(sessionId) {
     win.loadURL(
       buildSessionWindowUrl(sessionId, {
         devServer: DEV_SERVER,
-        rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex()
+        rendererIndexPath: DEV_SERVER ? undefined : resolveRendererIndex(),
+        watch
       })
     )
 
@@ -4917,7 +5093,11 @@ function createWindow() {
     trafficLightPosition: IS_MAC ? WINDOW_BUTTON_POSITION : undefined,
     vibrancy: IS_MAC ? 'sidebar' : undefined,
     icon,
-    backgroundColor: '#f7f7f7',
+    // Hidden until the first themed paint so macOS `vibrancy` (which ignores
+    // `backgroundColor` and follows the OS appearance) can't flash a light
+    // material before the renderer paints the app theme. See createSessionWindow.
+    show: false,
+    backgroundColor: getWindowBackgroundColor(),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -4952,6 +5132,10 @@ function createWindow() {
       })
     }
   }
+
+  mainWindow.once('ready-to-show', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.show()
+  })
 
   mainWindow.on('will-enter-full-screen', () => sendWindowStateChanged(true))
   mainWindow.on('enter-full-screen', () => sendWindowStateChanged(true))
@@ -5064,12 +5248,12 @@ ipcMain.handle('hermes:backend:touch', async (_event, profile) => {
   return { ok: true }
 })
 ipcMain.handle('hermes:gateway:ws-url', async (_event, profile) => freshGatewayWsUrl(profile))
-ipcMain.handle('hermes:window:openSession', async (_event, sessionId) => {
+ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
   if (typeof sessionId !== 'string' || !sessionId.trim()) {
     return { ok: false, error: 'invalid-session-id' }
   }
 
-  createSessionWindow(sessionId.trim())
+  createSessionWindow(sessionId.trim(), { watch: opts?.watch === true })
 
   return { ok: true }
 })
@@ -5078,8 +5262,8 @@ ipcMain.handle('hermes:bootstrap:reset', async () => {
   // reset connection state so the next startHermes() call restarts the
   // full backend flow (including a fresh runBootstrap pass).
   rememberLog('[bootstrap] reset requested by renderer; clearing latched failure')
+  await teardownPrimaryBackendAndWait()
   bootstrapFailure = null
-  connectionPromise = null
   bootstrapState = {
     active: false,
     manifest: null,
@@ -5477,6 +5661,18 @@ ipcMain.on('hermes:titlebar-theme', (_event, payload) => {
   mainWindow?.setTitleBarOverlay?.(getTitleBarOverlayOptions())
 })
 
+// Pin the native appearance to the app theme (see NATIVE_THEME_CONFIG_PATH).
+ipcMain.on('hermes:native-theme', (_event, mode) => {
+  if (!THEME_SOURCES.has(mode)) {
+    return
+  }
+
+  if (nativeTheme.themeSource !== mode) {
+    nativeTheme.themeSource = mode
+    writePersistedThemeSource(mode)
+  }
+})
+
 ipcMain.handle('hermes:openExternal', (_event, url) => {
   if (!openExternalUrl(url)) {
     throw new Error('Invalid external URL')
@@ -5541,48 +5737,6 @@ ipcMain.handle('hermes:logs:reveal', async () => {
 })
 
 ipcMain.handle('hermes:logs:recent', async () => ({ path: DESKTOP_LOG_PATH, lines: hermesLog.slice(-200) }))
-
-// Always-hidden noise (covers non-git projects too — gitignore would catch
-// these anyway when present, but we want the same hygiene without one).
-const FS_READDIR_HIDDEN = new Set([
-  '.git',
-  '.hg',
-  '.svn',
-  '.cache',
-  '.next',
-  '.turbo',
-  '.venv',
-  '__pycache__',
-  'build',
-  'dist',
-  'node_modules',
-  'target',
-  'venv'
-])
-
-function findGitRoot(start) {
-  let dir = start
-
-  for (let i = 0; i < 50; i += 1) {
-    try {
-      if (fs.existsSync(path.join(dir, '.git'))) {
-        return dir
-      }
-    } catch {
-      return null
-    }
-
-    const parent = path.dirname(dir)
-
-    if (parent === dir) {
-      return null
-    }
-
-    dir = parent
-  }
-
-  return null
-}
 
 function isExecutableFile(filePath) {
   if (!filePath || !path.isAbsolute(filePath)) {
@@ -5766,46 +5920,9 @@ function disposeTerminalSession(id) {
   return true
 }
 
-ipcMain.handle('hermes:fs:readDir', async (_event, dirPath) => {
-  const resolved = path.resolve(String(dirPath || ''))
+ipcMain.handle('hermes:fs:readDir', async (_event, dirPath) => readDirForIpc(dirPath))
 
-  if (!resolved) {
-    return { entries: [], error: 'invalid-path' }
-  }
-
-  try {
-    const dirents = await fs.promises.readdir(resolved, { withFileTypes: true })
-
-    const entries = dirents
-      .filter(d => {
-        if (FS_READDIR_HIDDEN.has(d.name)) {
-          return false
-        }
-
-        return true
-      })
-      .map(d => ({ name: d.name, path: path.join(resolved, d.name), isDirectory: d.isDirectory() }))
-      .sort((a, b) => Number(b.isDirectory) - Number(a.isDirectory) || a.name.localeCompare(b.name))
-
-    return { entries }
-  } catch (error) {
-    return { entries: [], error: error?.code || 'read-error' }
-  }
-})
-
-ipcMain.handle('hermes:fs:gitRoot', async (_event, startPath) => {
-  const input = String(startPath || '')
-  const resolved = input.startsWith('file:') ? fileURLToPath(input) : path.resolve(input)
-
-  try {
-    const stat = await fs.promises.stat(resolved)
-    const start = stat.isDirectory() ? resolved : path.dirname(resolved)
-
-    return findGitRoot(start)
-  } catch {
-    return findGitRoot(resolved)
-  }
-})
+ipcMain.handle('hermes:fs:gitRoot', async (_event, startPath) => gitRootForIpc(startPath))
 
 ipcMain.handle('hermes:terminal:start', async (event, payload = {}) => {
   if (!nodePty) {
@@ -5993,11 +6110,15 @@ async function getUninstallSummary() {
       resolve(value)
     }
     try {
-      const child = spawn(py, ['-m', 'hermes_cli.main', 'uninstall', '--gui-summary'], hiddenWindowsChildOptions({
-        cwd: agentRoot,
-        env: { ...process.env, HERMES_HOME, NO_COLOR: '1' },
-        stdio: ['ignore', 'pipe', 'ignore']
-      }))
+      const child = spawn(
+        py,
+        ['-m', 'hermes_cli.main', 'uninstall', '--gui-summary'],
+        hiddenWindowsChildOptions({
+          cwd: agentRoot,
+          env: { ...process.env, HERMES_HOME, NO_COLOR: '1' },
+          stdio: ['ignore', 'pipe', 'ignore']
+        })
+      )
       child.stdout.on('data', chunk => {
         stdout += chunk.toString()
       })
@@ -6143,6 +6264,106 @@ ipcMain.handle('hermes:vscode-theme:fetch', async (_event, id) => fetchMarketpla
 // Search the Marketplace for color-theme extensions (empty query = top installs).
 ipcMain.handle('hermes:vscode-theme:search', async (_event, query) => searchMarketplaceThemes(String(query || ''), 20))
 
+// ---------------------------------------------------------------------------
+// hermes:// deep links (e.g. hermes://blueprint/morning-brief?time=08:00).
+// A docs/dashboard "Send to App" button opens this URL; we route it into the
+// running app's chat composer. Three delivery paths: macOS 'open-url',
+// Win/Linux running-app 'second-instance' (argv), Win/Linux cold-start argv.
+// ---------------------------------------------------------------------------
+const HERMES_PROTOCOL = 'hermes'
+let _pendingDeepLink = null
+let _rendererReadyForDeepLink = false
+
+function _extractDeepLink(argv) {
+  if (!Array.isArray(argv)) return null
+  return argv.find(a => typeof a === 'string' && a.startsWith(`${HERMES_PROTOCOL}://`)) || null
+}
+
+function handleDeepLink(url) {
+  if (!url || typeof url !== 'string') return
+  let parsed
+  try {
+    parsed = new URL(url)
+  } catch {
+    rememberLog(`[deeplink] ignoring malformed url: ${url}`)
+    return
+  }
+  // hermes://blueprint/<key>?slot=val  -> host="blueprint", path="/<key>"
+  const kind = parsed.hostname || ''
+  const name = decodeURIComponent((parsed.pathname || '').replace(/^\//, ''))
+  const params = {}
+  parsed.searchParams.forEach((v, k) => {
+    params[k] = v
+  })
+  const payload = { kind, name, params }
+
+  if (!_rendererReadyForDeepLink || !mainWindow || mainWindow.isDestroyed()) {
+    _pendingDeepLink = payload
+    return
+  }
+  try {
+    if (mainWindow.isMinimized()) mainWindow.restore()
+    mainWindow.focus()
+    mainWindow.webContents.send('hermes:deep-link', payload)
+    rememberLog(`[deeplink] delivered ${kind}/${name}`)
+  } catch (err) {
+    rememberLog(`[deeplink] delivery failed: ${err.message}`)
+  }
+}
+
+// Renderer calls this (via IPC) once it has mounted its deep-link listener, so
+// a link that arrived during boot/install is flushed exactly once.
+ipcMain.handle('hermes:deep-link-ready', () => {
+  _rendererReadyForDeepLink = true
+  if (_pendingDeepLink) {
+    const queued = _pendingDeepLink
+    _pendingDeepLink = null
+    handleDeepLink(
+      `${HERMES_PROTOCOL}://${queued.kind}/${encodeURIComponent(queued.name)}` +
+        (Object.keys(queued.params).length ? '?' + new URLSearchParams(queued.params).toString() : '')
+    )
+  }
+  return { ok: true }
+})
+
+function registerDeepLinkProtocol() {
+  try {
+    if (process.defaultApp && process.argv.length >= 2) {
+      // Dev: register with the electron exec path + entry script so the OS can
+      // relaunch us with the URL.
+      app.setAsDefaultProtocolClient(HERMES_PROTOCOL, process.execPath, [path.resolve(process.argv[1])])
+    } else {
+      app.setAsDefaultProtocolClient(HERMES_PROTOCOL)
+    }
+  } catch (err) {
+    rememberLog(`[deeplink] protocol registration failed: ${err.message}`)
+  }
+}
+
+// Single-instance lock: deep links on a running app (Win/Linux) arrive as a
+// second-instance argv. Without the lock a second `hermes://` launch spawns a
+// whole new app instead of routing into the running one.
+const _gotSingleInstanceLock = app.requestSingleInstanceLock()
+if (!_gotSingleInstanceLock) {
+  app.quit()
+} else {
+  app.on('second-instance', (_event, argv) => {
+    const url = _extractDeepLink(argv)
+    if (url) handleDeepLink(url)
+    else if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.focus()
+    }
+  })
+}
+
+// macOS delivers deep links via 'open-url' — register early (can fire before
+// whenReady; handleDeepLink queues until the renderer is ready).
+app.on('open-url', (event, url) => {
+  event.preventDefault()
+  handleDeepLink(url)
+})
+
 app.whenReady().then(() => {
   if (IS_MAC) {
     Menu.setApplicationMenu(buildApplicationMenu())
@@ -6151,10 +6372,15 @@ app.whenReady().then(() => {
   }
   installMediaPermissions()
   registerMediaProtocol()
+  registerDeepLinkProtocol()
   ensureWslWindowsFonts()
   configureSpellChecker()
   registerPowerResumeListeners()
   createWindow()
+
+  // Win/Linux cold start: the launching hermes:// URL is in our own argv.
+  const _coldStartLink = _extractDeepLink(process.argv)
+  if (_coldStartLink) handleDeepLink(_coldStartLink)
 
   app.on('activate', () => {
     // Recreate the primary window if it's gone. Guard on mainWindow directly

@@ -459,7 +459,10 @@ class _Resume:
 
     def mint(self, prompts: bool = True) -> tuple:
         """``(runtime sid, source, cwd)`` for the live record this resume registers (+ gateway prompts on)."""
-        ids = _new_runtime_ids(self.params)
+        # Plugin-owned durable sessions stay fenced even if a client supplies another source.
+        params = ({**self.params, "source": "plugin_session"}
+                  if (self.found or {}).get("source") == "plugin_session" else self.params)
+        ids = _new_runtime_ids(params)
         if prompts:
             _enable_gateway_prompts()
         return *ids, self.profile_resume_cwd or _default_session_cwd()
@@ -599,7 +602,9 @@ def _resume_follow_tip(ctx: _Resume) -> None:
     tip = ctx.target
     with contextlib.suppress(Exception):
         from tools.bot_mode_probe import BOT_CHAT_TITLE
-        if (ctx.found.get("title") or "").strip() == BOT_CHAT_TITLE:
+        if ((ctx.found.get("title") or "").strip() == BOT_CHAT_TITLE
+                or ctx.params.get("source") == "plugin_session"
+                or ctx.found.get("source") == "plugin_session"):
             tip = ctx.db.get_compression_tip(ctx.target) or ctx.target
         else:
             tip = ctx.db.resolve_resume_session_id(ctx.target)
@@ -1941,6 +1946,11 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if expected_plugin := params.get("_expected_plugin_turn"):
+        with session["history_lock"]:
+            turn = session.get("_plugin_turn")
+            if turn is None or (*turn.owner, turn.operation_key) != expected_plugin:
+                return _ok(rid, {"status": "not_interrupted", "interrupted": False})
     if expected := _str_param(params, "expected_hosted_task_id"):
         with session["history_lock"]:
             task = session.get("_hosted_room_task")
@@ -1953,7 +1963,7 @@ def _(rid, params: dict) -> dict:
         except Exception as exc:
             return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
         return _ok(rid, {"status": "interrupted", "turn_isolation": True})
-    session, err = _sess(params, rid)
+    session, err = (session, None) if expected_plugin else _sess(params, rid)
     if err:
         return err
     _interrupt_session_turn(sid, session)

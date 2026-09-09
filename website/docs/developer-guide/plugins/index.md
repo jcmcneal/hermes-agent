@@ -1773,3 +1773,9 @@ def handler(args, **kwargs):
 # Good — model knows exactly when and how
 "description": "Evaluate a mathematical expression. Use for arithmetic, trig, logarithms. Supports: +, -, *, /, **, sqrt, sin, cos, log, pi, e."
 ```
+
+### Persistent profile sessions
+
+Backend plugins can use `ctx.sessions` for exact session reuse, durable operation admission,
+completion receipts and cancellation. See [Persistent plugin sessions](../plugin-sessions.md)
+for the authorization boundary, recovery behavior and supported runtime.

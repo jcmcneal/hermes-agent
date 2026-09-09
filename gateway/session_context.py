@@ -153,9 +153,29 @@ def reset_session_vars() -> None:
     _runtime_cwd("clear_session_cwd")
 
 
+_PLUGIN_SESSION_ENV: ContextVar[dict[str, str]] = ContextVar("plugin_session_env", default={})
+
+
+@contextmanager
+def plugin_session_env(values: dict[str, str]) -> Iterator[None]:
+    """Bind local plugin tool context without changing process environment or Hermes identity."""
+    token = _PLUGIN_SESSION_ENV.set(dict(values))
+    try:
+        yield
+    finally:
+        _PLUGIN_SESSION_ENV.reset(token)
+
+
+def plugin_session_env_values() -> dict[str, str]:
+    """Copy the current plugin turn context for local subprocess environment injection."""
+    return dict(_PLUGIN_SESSION_ENV.get())
+
+
 def get_session_env(name: str, default: str = "") -> str:
     """Read a session var by legacy ``HERMES_SESSION_*`` name; drop-in for os.getenv.  The
     ContextVar wins if ever set here (even to ``""``); else ``os.environ``; else *default*."""
+    if name in (extra := _PLUGIN_SESSION_ENV.get()):
+        return extra[name]
     var = _VAR_MAP.get(name)
     if var is not None and (value := var.get()) is not _UNSET:
         return value

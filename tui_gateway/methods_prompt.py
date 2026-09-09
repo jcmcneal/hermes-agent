@@ -482,9 +482,6 @@ def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_termina
             session["running"] = False
             session["last_active"] = time.time()
         _emit("session.info", sid, _session_info(session.get("agent"), session))
-        if hosted_terminal_callback is not None:
-            hosted_terminal_callback({"status": "failed", "text": "", "error":
-                                      (err.get("error") or {}).get("message", "agent initialization failed")})
         return
     with session["history_lock"]:
         if session.get("_turn_cancel_requested") or not session.get("running"):
@@ -511,8 +508,6 @@ def _lock_in_submit_turn(
     cut, mark the turn running + in flight.  Returns ``(err, survivor_fields)``."""
     fields = {}
     with session["history_lock"]:
-        if (hosted_task is not None or params.get("_plugin_turn") is not None) and session.get("running"):
-            return _err(rid, 4091, "internal session is busy"), fields
         # A watch session's run lives in the PARENT turn (own running flag False); typing
         # mid-run would build a second agent racing the child on the same stored session.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
@@ -527,10 +522,6 @@ def _lock_in_submit_turn(
                 rid, sid, session, params, requested_rebind_ids)
             if err is not None:
                 return err, {}
-        if params.get("_plugin_turn") is not None:
-            session["_plugin_turn"] = params["_plugin_turn"]
-        else:
-            session.pop("_plugin_turn", None)
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
@@ -558,13 +549,6 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
-    plugin_turn = params.get("_plugin_turn")
-    if plugin_turn is None and (session.get("source") == "plugin_session" or session.get("_plugin_session_owner")):
-        return _err(rid, 4122, "this session is managed by its plugin")
-    if plugin_turn is not None:
-        from tui_gateway.plugin_sessions import validate_plugin_turn
-        if not validate_plugin_turn(plugin_turn, session):
-            return _err(rid, 4122, "invalid plugin session turn proof")
     hosted_task = params.get("_hosted_task")
     hosted_terminal_callback = params.get("_hosted_terminal_callback")
     internal_hosted_submit = hosted_task is not None or hosted_terminal_callback is not None
@@ -586,9 +570,8 @@ def _(rid, params: dict) -> dict:
         # `/work fix it` sends nine literal chars.
         text = _expand_skill_invocation_for_replay(text, str(session.get("session_key") or ""))
     turn_isolation = _session_uses_compute_host(session, _load_dashboard_process_isolation_config())
-    internal_submit = internal_hosted_submit or plugin_turn is not None
-    if internal_submit and turn_isolation:
-        return _err(rid, 4121, "internal session turns do not support isolated compute workers yet")
+    if internal_hosted_submit and turn_isolation:
+        return _err(rid, 4121, "hosted room turns do not support isolated compute workers yet")
     # Re-bind to the current transport: streaming must stay on the active websocket even
     # if a disconnect/fallback moved the session to stdio.
     with _session_resume_lock:
@@ -606,8 +589,8 @@ def _(rid, params: dict) -> dict:
         with session["history_lock"]:
             if not session.get("running"):
                 break
-            if internal_submit:
-                return _err(rid, 4091, "internal session is busy")
+            if internal_hosted_submit:
+                return _err(rid, 4091, "hosted room member session is busy")
             busy_transport = t or session.get("transport")
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport, queued=bool(params.get("queued")))
@@ -646,8 +629,7 @@ def _(rid, params: dict) -> dict:
         _start_agent_build(sid, session)
     run_thread = threading.Thread(
         target=lambda: _run_after_agent_ready(
-            rid, sid, session, text, display_kind,
-            plugin_turn.on_terminal if plugin_turn is not None else hosted_terminal_callback),
+            rid, sid, session, text, display_kind, hosted_terminal_callback),
         daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread

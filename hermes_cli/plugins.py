@@ -381,12 +381,6 @@ class PluginContext:
             self._llm = PluginLlm(plugin_id=self.plugin_id)
         return self._llm
 
-    @property
-    def sessions(self) -> Any:
-        """Backend-owned persistent profile sessions, isolated by plugin and caller principal."""
-        from tui_gateway.plugin_sessions import get_session_service
-        return get_session_service(self.plugin_id)
-
     @cached_property
     def subagent_lifecycle(self) -> Any:
         """Plugin-safe subagent lifecycle service: serializable handles and immutable snapshots,

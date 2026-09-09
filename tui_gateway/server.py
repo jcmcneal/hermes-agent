@@ -731,9 +731,6 @@ def handle_request(req: dict) -> dict | None:
     rid, method, params = normalized
     if not (fn := _methods.get(method)):
         return _err(rid, -32601, f"unknown method: {method}")
-    from tui_gateway.plugin_sessions import plugin_session_mutation_error
-    if refusal := plugin_session_mutation_error(sys.modules[__name__], method, params):
-        return _err(rid, 4122, refusal)
     token = _current_rpc_method.set(method)
     try:
         return fn(rid, params)
@@ -1194,16 +1191,12 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
         resolved = cwd if cwd is not None else (str(sess.get("cwd") or "") if sess is not None else "")
         source = _resolve_session_platform()
         browser_control_principal = browser_control_transport_family = ""
-        plugin_identity = {}
         # Live conversation id for subprocess HERMES_SESSION_ID: an explicitly empty contextvar is authoritative
         # (no os.environ fallback), so never leave it "" — agent's durable session_id, then session_key.
         session_id = session_key
         if sess is not None:
             source = _session_source(sess)
             session_id = getattr(sess.get("agent"), "session_id", None) or session_key
-            if turn := sess.get("_plugin_turn"):
-                plugin_identity = dict(scope_id=turn.owner[0], user_id=turn.owner[1],
-                                       profile=turn.owner[2], chat_id=turn.owner[3])
             identity = getattr(sess.get("transport"), "auth_identity", None)
             if _methods_browser_control._is_authenticated_identity(identity):
                 browser_control_principal = _methods_browser_control._principal_digest(identity)
@@ -1212,7 +1205,7 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
             session_key=session_key, session_id=session_id, source=source,
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family, cwd=resolved,
-            ui_session_id=ui_session_id, cron_session="", **plugin_identity)
+            ui_session_id=ui_session_id, cron_session="")
     return []
 
 

@@ -777,19 +777,12 @@ def _run_prompt_submit(
         # before any tool can commission a child (delegate_task captures it as authority).
         transport_token = bind_transport(session.get("transport"))
         runtime_session_token = _current_runtime_session_record.set(session)
-        from gateway.session_context import plugin_session_env
-        plugin_turn = session.get("_plugin_turn")
-        plugin_context = plugin_session_env(plugin_turn.session_env if plugin_turn is not None else {})
-        plugin_context.__enter__()
-        previous_max_iterations = getattr(session["agent"], "max_iterations", None)
-        if plugin_turn is not None and plugin_turn.max_turns is not None:
-            session["agent"].max_iterations = plugin_turn.max_turns
         st = _TurnRun(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
             receipt_committed=terminal_callback is None)
+        st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None)
         goal_followup = None
         try:
-            st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None)
             prepared = _prepare_turn_input(sid, session, st, text, images)
             if prepared is None:
                 if st.terminal_callback is not None and not st.receipt_attempted:
@@ -815,14 +808,9 @@ def _run_prompt_submit(
         except Exception as e:
             _recover_turn_exception(sid, session, st, e)
         finally:
-            try:
-                _finish_turn(sid, session, st)
-            finally:
-                if plugin_turn is not None and plugin_turn.max_turns is not None:
-                    session["agent"].max_iterations = previous_max_iterations
-                plugin_context.__exit__(None, None, None)
-                _current_runtime_session_record.reset(runtime_session_token)
-                reset_transport(transport_token)
+            _finish_turn(sid, session, st)
+            _current_runtime_session_record.reset(runtime_session_token)
+            reset_transport(transport_token)
             # A stale interim closure must not fire during a later turn.
             st.agent.interim_assistant_callback = None
             with session["history_lock"]:

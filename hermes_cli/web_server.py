@@ -166,12 +166,7 @@ async def _lifespan(app: "FastAPI"):
     # contended state.db migration, so keep it off the pre-yield path: Group
     # Chat must degrade on its own rather than block every Desktop feature.
     from tui_gateway import methods_groups as _hosted_groups
-    import tui_gateway.server
-    from tui_gateway.plugin_sessions import install_session_service, stop_session_service
-    try:
-        install_session_service(tui_gateway.server)
-    except Exception:
-        _log.exception("Persistent plugin session execution is unavailable")
+    import tui_gateway.server  # noqa: F401
 
     hosted_room_start_cancel = threading.Event()
 
@@ -243,7 +238,6 @@ async def _lifespan(app: "FastAPI"):
     try:
         yield
     finally:
-        stop_session_service()
         hosted_room_start_cancel.set()
         _hosted_groups.stop_hosted_room_service(timeout=5.0)
         hosted_room_start_thread.join(timeout=1.0)

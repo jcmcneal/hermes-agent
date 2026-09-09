@@ -240,8 +240,6 @@ class BaseEnvironment(ABC):
         retaining the exclusion keeps that old value from leaking to a later profile."""
         if not self._profile_scoped_passthrough:
             return ()
-        from gateway.session_context import plugin_session_env_values
-        self._snapshot_passthrough_names.update(plugin_session_env_values())
         try:
             from agent.secret_scope import is_multiplex_active
             if is_multiplex_active():

@@ -85,6 +85,24 @@ def _detach_session_transport(session: dict | None, transport) -> bool:
         return _session_has_live_transport(session, excluding=transport)
 
 
+def _attach_live_dashboard_clients(session: dict | None) -> bool:
+    """Fan plugin-owned turns to every connected dashboard/iOS WebSocket.
+
+    Plugin submits run inside the backend with no client transport bound, so
+    ``write_json`` would otherwise drop ``message.delta`` / ``tool.start`` on
+    stdio. Live transports are the iOS/dashboard ``/api/ws`` peers.
+    """
+    if not session:
+        return False
+    with _live_transports_lock:
+        clients = list(_live_transports)
+    attached = False
+    for transport in clients:
+        if _attach_session_transport(session, transport):
+            attached = True
+    return attached
+
+
 def _detach_transport_from_sessions(transport) -> list[tuple[str, dict]]:
     """Remove even closed/pruned peers' viewer entries; return clientless slots."""
     with _sessions_lock:

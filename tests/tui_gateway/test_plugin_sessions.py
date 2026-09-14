@@ -370,3 +370,60 @@ def test_plugin_turn_emits_dashboard_deltas_to_live_ws_clients(runtime):
         assert service.ensure_session(principal_id='alice', profile='default', conversation_key='dm')['session_id'] == sid
     finally:
         server.unregister_live_transport(peer)
+
+
+def test_plugin_origin_stamps_event_frames_and_emits_run_start(runtime, monkeypatch):
+    service, host, calls, home = runtime
+    emitted = []
+    monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: emitted.append((event, sid, payload)))
+    pending = []
+
+    def hold(rid, sid, record, text, display_kind, callback):
+        pending.append(sid)
+        record["_run_thread"] = SimpleNamespace(is_alive=lambda: True)
+
+    monkeypatch.setattr(server, "_run_after_agent_ready", hold)
+    origin = {
+        "conversation_id": "conv-123",
+        "run_id": "run-456",
+        "profile_id": "swe-id",
+        "ignored": 1,
+        "conversation_id_overflow": "x" * 200,
+    }
+    result = service.submit(**request(origin=origin))
+    assert result["status"] == "running"
+    sid = pending[0]
+    turn = server._sessions[sid]["_plugin_turn"]
+    assert turn.origin == {
+        "conversation_id": "conv-123",
+        "run_id": "run-456",
+        "profile_id": "swe-id",
+    }
+    start = [item for item in emitted if item[0] == "messaging.run.start"]
+    assert start and start[0][1] == sid
+    assert start[0][2] == turn.origin
+    frame = server._event_frame("message.delta", sid, {"text": "Hel"})
+    assert frame["params"]["conversation_id"] == "conv-123"
+    assert frame["params"]["run_id"] == "run-456"
+    assert frame["params"]["profile_id"] == "swe-id"
+    assert frame["params"]["payload"]["text"] == "Hel"
+    bare = server._event_frame("message.delta", "unknown-sid", {"text": "nope"})
+    assert "conversation_id" not in bare["params"]
+
+
+def test_plugin_origin_is_ignored_when_incomplete(runtime, monkeypatch):
+    service, host, calls, home = runtime
+    pending = []
+
+    def hold(rid, sid, record, text, display_kind, callback):
+        pending.append(sid)
+        record["_run_thread"] = SimpleNamespace(is_alive=lambda: True)
+
+    monkeypatch.setattr(server, "_run_after_agent_ready", hold)
+    result = service.submit(**request(origin={"conversation_id": "only-conv"}))
+    assert result["status"] == "running"
+    sid = pending[0]
+    assert server._sessions[sid]["_plugin_turn"].origin is None
+    frame = server._event_frame("message.delta", sid, {"text": "x"})
+    assert "conversation_id" not in frame["params"]
+    assert "run_id" not in frame["params"]

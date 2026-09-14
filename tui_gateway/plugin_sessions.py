@@ -28,6 +28,29 @@ class SessionServiceConflict(RuntimeError):
     pass
 
 
+_ORIGIN_MAX = 128
+_ORIGIN_REQUIRED = ("conversation_id", "run_id")
+_ORIGIN_OPTIONAL = ("profile_id",)
+
+
+def safe_plugin_origin(origin: Any) -> dict[str, str] | None:
+    """Keep only nonempty string join keys. Invalid origin is ignored, never fatal."""
+    if not isinstance(origin, dict):
+        return None
+    out: dict[str, str] = {}
+    for key in (*_ORIGIN_REQUIRED, *_ORIGIN_OPTIONAL):
+        value = origin.get(key)
+        if not isinstance(value, str):
+            continue
+        trimmed = value.strip()
+        if not trimmed or len(trimmed) > _ORIGIN_MAX:
+            continue
+        out[key] = trimmed
+    if all(key in out for key in _ORIGIN_REQUIRED):
+        return out
+    return None
+
+
 @dataclass(frozen=True)
 class _PluginTurn:
     """Python-only admission proof; JSON/RPC clients cannot construct this object."""
@@ -36,6 +59,7 @@ class _PluginTurn:
     on_terminal: Callable[[dict], None]
     session_env: dict[str, str]
     max_turns: int | None
+    origin: dict[str, str] | None = None
 
 
 def validate_plugin_turn(turn: Any, session: dict) -> bool:
@@ -93,9 +117,11 @@ class PluginSessionService:
 
     def submit(self, *, principal_id: str, profile: str, conversation_key: str,
                operation_key: str, text: str, title: str | None = None,
-               session_env: dict[str, str] | None = None, max_turns: int | None = None) -> dict:
+               session_env: dict[str, str] | None = None, max_turns: int | None = None,
+               origin: Any = None) -> dict:
         return self._host.submit(self.plugin_id, principal_id, profile, conversation_key,
-                                 operation_key, text, title, session_env or {}, max_turns)
+                                 operation_key, text, title, session_env or {}, max_turns,
+                                 origin)
 
     def status(self, *, principal_id: str, operation_key: str) -> dict | None:
         return self._host.status(self.plugin_id, principal_id, operation_key)
@@ -213,7 +239,8 @@ class _SessionHost:
                 return dict(profile=profile, conversation_key=conversation, session_id=sid)
             return dict(profile=profile, conversation_key=conversation, session_id=self._resume(binding))
 
-    def submit(self, plugin, principal, profile, conversation, operation, text, title, session_env, max_turns):
+    def submit(self, plugin, principal, profile, conversation, operation, text, title, session_env, max_turns,
+               origin=None):
         owner = self._owner(plugin, principal, profile, conversation)
         _required(operation, "operation_key")
         _required(text, "text")
@@ -250,7 +277,7 @@ class _SessionHost:
                             digest, "running", None, None, time.time()))
             turn = _PluginTurn(owner, operation,
                                lambda result: self._complete(plugin, principal, operation, result),
-                               dict(session_env), max_turns)
+                               dict(session_env), max_turns, safe_plugin_origin(origin))
             try:
                 self._call("prompt.submit", profile=profile, session_id=sid, text=text, _plugin_turn=turn)
             except SessionServiceConflict as exc:

@@ -623,6 +623,10 @@ def _(rid, params: dict) -> dict:
         rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task)
     if err is not None:
         return err
+    if plugin_turn is not None:
+        origin = getattr(plugin_turn, "origin", None)
+        if isinstance(origin, dict) and origin.get("conversation_id") and origin.get("run_id"):
+            _emit("messaging.run.start", sid, dict(origin))
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(
             rid, sid, session, text, display_kind=display_kind)

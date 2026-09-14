@@ -585,8 +585,27 @@ def write_json(obj: dict) -> bool:
     return (current_transport() or _stdio_transport).write(obj)
 
 
+def _plugin_origin_fields(sid: str) -> dict[str, str]:
+    """Join keys from the in-flight plugin turn, if the session has one."""
+    if not sid:
+        return {}
+    turn = (_sessions.get(sid) or {}).get("_plugin_turn")
+    origin = getattr(turn, "origin", None)
+    if not isinstance(origin, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key in ("conversation_id", "run_id", "profile_id"):
+        value = origin.get(key)
+        if isinstance(value, str) and value:
+            out[key] = value
+    if "conversation_id" in out and "run_id" in out:
+        return out
+    return {}
+
+
 def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
     params: dict = {"type": event, "session_id": sid, **({"payload": payload} if payload is not None else {})}
+    params.update(_plugin_origin_fields(sid))
     return {"jsonrpc": "2.0", "method": "event", "params": params}
 
 

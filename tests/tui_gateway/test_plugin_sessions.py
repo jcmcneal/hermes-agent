@@ -323,3 +323,39 @@ def test_authorized_native_approval_response_still_reaches_existing_handler(runt
     assert response['result']['resolved'] == 1
     assert resolved == [(server._sessions[sid]['session_key'], 'once',
                          {'resolve_all': False, 'request_id': 'exact-request'})]
+
+
+class _LivePeer:
+    def __init__(self):
+        self.frames = []
+
+    def write(self, obj):
+        self.frames.append(obj)
+        return True
+
+    def close(self):
+        return None
+
+
+def test_plugin_turn_emits_dashboard_deltas_to_live_ws_clients(runtime):
+    """iOS binds by session_id without session.resume; live /api/ws peers must see tokens."""
+    service, host, calls, home = runtime
+    peer = _LivePeer()
+    server.register_live_transport(peer)
+    try:
+        result = service.submit(**request())
+        assert result['status'] == 'completed', result
+        sid = next(iter(server._sessions))
+        session = server._sessions[sid]
+        assert server._session_transport_contains(session, peer)
+        # The fixture stubs ``_emit``; write_json is the live dashboard fanout path.
+        server.write_json(server._event_frame("message.delta", sid, {"text": "Hello"}))
+        server.write_json(server._event_frame("tool.start", sid, {"name": "web_search", "args_text": "q=test"}))
+        kinds = [frame.get("params", {}).get("type") for frame in peer.frames]
+        assert "message.delta" in kinds
+        assert "tool.start" in kinds
+        delta = next(frame for frame in peer.frames if frame.get("params", {}).get("type") == "message.delta")
+        assert delta["params"]["session_id"] == sid
+        assert delta["params"]["payload"]["text"] == "Hello"
+    finally:
+        server.unregister_live_transport(peer)

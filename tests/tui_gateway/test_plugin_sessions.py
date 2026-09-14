@@ -88,6 +88,8 @@ def test_exact_session_reuse_and_durable_duplicate_receipts(runtime):
     assert len(calls) == 1
     second = service.submit(**{**request(), 'operation_key': 'op-2', 'text': 'follow up'})
     assert second['status'] == 'completed', second
+    assert first['session_id'] in server._sessions
+    assert first['session_id'] != server._sessions[first['session_id']]['session_key']
     assert second['session_id'] == first['session_id']
     assert calls[1]['history'][-1]['content'] == 'reply:hello'
     assert calls[0]['peer'] == 'reviewer' and calls[1]['peer'] == ''
@@ -114,11 +116,13 @@ def test_profile_and_principal_bindings_are_isolated(runtime):
     assert calls[1]['profile_home'] == str(work)
     assert calls[1]['profile'] == 'work' and calls[1]['principal'] == 'alice'
     assert calls[2]['principal'] == 'bob'
+    two_key = server._sessions[two['session_id']]['session_key']
+    one_key = server._sessions[one['session_id']]['session_key']
     with server._profile_db({'profile': 'default'}) as default:
-        assert default.get_session(two['session_id']) is None
+        assert default.get_session(two_key) is None
     with server._profile_db({'profile': 'work'}) as scoped:
-        assert scoped.get_session(two['session_id']) is not None
-        assert scoped.get_session(one['session_id']) is None
+        assert scoped.get_session(two_key) is not None
+        assert scoped.get_session(one_key) is None
 
 
 def test_cancel_fences_late_completion_and_waits_for_runtime_drain(runtime, monkeypatch):
@@ -204,18 +208,21 @@ def test_plugin_context_reaches_local_children_without_snapshot_leak(tmp_path):
 def test_only_proven_compression_successors_are_resumed(runtime, compress):
     service, host, calls, home = runtime
     first = service.submit(**request())
-    anchor = first['session_id']
+    live = first['session_id']
+    assert live in server._sessions
+    stored = server._sessions[live]['session_key']
     with server._profile_db({'profile': 'default'}) as db:
         if compress:
-            db.end_session(anchor, 'compression')
-        db.create_session('successor', source='plugin_session', parent_session_id=anchor)
+            db.end_session(stored, 'compression')
+        db.create_session('successor', source='plugin_session', parent_session_id=stored)
         db.append_message('successor', 'user', 'child question')
         db.append_message('successor', 'assistant', 'child reply')
     server._sessions.clear()  # cold resume, as after backend restart
     second = service.submit(**{**request(), 'operation_key': 'op-2', 'text': 'next'})
     assert second['status'] == 'completed', second
-    assert second['session_id'] == anchor
-    assert calls[-1]['session_id'] == ('successor' if compress else anchor)
+    assert second['session_id'] in server._sessions
+    assert second['session_id'] != stored
+    assert calls[-1]['session_id'] == ('successor' if compress else stored)
     assert calls[-1]['history'][-1]['content'] == ('child reply' if compress else 'reply:hello')
 
 
@@ -269,9 +276,10 @@ def test_shutdown_fences_all_operations_even_when_interrupt_raises(runtime, monk
 def test_cold_resume_cannot_remove_plugin_ownership_with_source_override(runtime):
     service, host, calls, home = runtime
     binding = service.ensure_session(principal_id='alice', profile='default', conversation_key='dm')
+    stored = server._sessions[binding['session_id']]['session_key']
     server._sessions.clear()
     resumed = server._methods['session.resume']('spoof', {
-        'session_id': binding['session_id'], 'profile': 'default', 'source': 'desktop', 'omit_messages': True})
+        'session_id': stored, 'profile': 'default', 'source': 'desktop', 'omit_messages': True})
     sid = resumed['result']['session_id']
     assert server._sessions[sid]['source'] == 'plugin_session'
     response = server._methods['prompt.submit']('bypass', {'session_id': sid, 'text': 'bypass journal'})
@@ -345,7 +353,9 @@ def test_plugin_turn_emits_dashboard_deltas_to_live_ws_clients(runtime):
     try:
         result = service.submit(**request())
         assert result['status'] == 'completed', result
-        sid = next(iter(server._sessions))
+        sid = result['session_id']
+        assert sid in server._sessions
+        assert sid != server._sessions[sid]['session_key']
         session = server._sessions[sid]
         assert server._session_transport_contains(session, peer)
         # The fixture stubs ``_emit``; write_json is the live dashboard fanout path.
@@ -357,5 +367,6 @@ def test_plugin_turn_emits_dashboard_deltas_to_live_ws_clients(runtime):
         delta = next(frame for frame in peer.frames if frame.get("params", {}).get("type") == "message.delta")
         assert delta["params"]["session_id"] == sid
         assert delta["params"]["payload"]["text"] == "Hello"
+        assert service.ensure_session(principal_id='alice', profile='default', conversation_key='dm')['session_id'] == sid
     finally:
         server.unregister_live_transport(peer)

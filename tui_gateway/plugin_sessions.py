@@ -210,10 +210,8 @@ class _SessionHost:
                     if sessions is None or sessions.get_session(stored) is None:
                         raise SessionServiceUnavailable("Session identity was not durably saved")
                 db.execute("INSERT INTO bindings VALUES (?,?,?,?,?)", (*owner, stored))
-                binding = self._binding(db, owner)
-            else:
-                self._resume(binding)
-            return dict(profile=profile, conversation_key=conversation, session_id=binding["session_id"])
+                return dict(profile=profile, conversation_key=conversation, session_id=sid)
+            return dict(profile=profile, conversation_key=conversation, session_id=self._resume(binding))
 
     def submit(self, plugin, principal, profile, conversation, operation, text, title, session_env, max_turns):
         owner = self._owner(plugin, principal, profile, conversation)
@@ -287,9 +285,11 @@ class _SessionHost:
         pending = None
         if active and callable(reader := getattr(self.server, "_pending_approval_request_payload", None)):
             pending = reader(str(record.get("session_key") or ""))
+        # Live /api/ws events stamp the runtime sid (write_json keys _sessions by it).
+        # Receipts must use that same id so overlay can bind runs[] without guessing.
         return {"pending_approval": pending, "not_admitted": bool(result and result.get("not_admitted")),
                 "active": active, "operation_key": row["operation_key"], "profile": row["profile"],
-                "conversation_key": row["conversation"], "session_id": row["session_id"],
+                "conversation_key": row["conversation"], "session_id": row["runtime_id"] or row["session_id"],
                 "status": row["status"], "result": result,
                 "error": row["error"]}
 
